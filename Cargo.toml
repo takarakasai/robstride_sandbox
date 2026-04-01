@@ -1,0 +1,31 @@
+[package]
+name = "robstride_sandbox"
+version = "0.1.0"
+edition = "2021"
+description = "Robstride Edulite05 motor controller via CAN bus"
+
+[dependencies]
+socketcan = "3.3"
+embedded-can = "0.4"
+serialport = "4"
+log = "0.4"
+env_logger = "0.11"
+thiserror = "2"
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+
+[[example]]
+name = "status"
+path = "examples/status.rs"
+
+[[example]]
+name = "position_control"
+path = "examples/position_control.rs"
+
+[[example]]
+name = "velocity_control"
+path = "examples/velocity_control.rs"
+
+[[example]]
+name = "torque_control"
+path = "examples/torque_control.rs"
