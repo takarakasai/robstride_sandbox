@@ -13,6 +13,12 @@ env_logger = "0.11"
 thiserror = "2"
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
+ratatui = "0.29"
+crossterm = "0.28"
+
+[[bin]]
+name = "robstride_tui"
+path = "src/tui_main.rs"
 
 [[example]]
 name = "status"

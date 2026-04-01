@@ -470,11 +470,23 @@ impl Motor {
                             Id::Standard(sid) => StandardId::as_raw(&sid) as u32,
                             Id::Extended(eid) => ExtendedId::as_raw(&eid),
                         };
-                        let (_ct, _extra, dev_id) = parse_can_id(raw_id);
+                        let (ct, extra, dev_id) = parse_can_id(raw_id);
 
-                        // Check if the response device_id matches what we probed
-                        // OR if the host_id field matches our request
-                        if dev_id == motor_id || (raw_id & 0xFF) == motor_id as u32 {
+                        // In Robstride responses, the CAN ID layout is:
+                        //   device_id field (bits 7-0)  = host_id (echo back)
+                        //   extra_data field (bits 23-8) = motor_id | status_bits
+                        // The motor_id is in the lower 8 bits of extra_data.
+                        let resp_motor_id = (extra & 0xFF) as u8;
+
+                        // Skip our own TX echo frames (gs_usb ECHO flag)
+                        // Echo frames have the same CAN ID we sent
+                        if dev_id == motor_id && ct == 0 {
+                            // This is our own ping being echoed back, skip
+                            continue;
+                        }
+
+                        // Check if this response is from the motor we pinged
+                        if resp_motor_id == motor_id || dev_id == motor_id {
                             found.push((motor_id, Some(resp.data().to_vec())));
                             break;
                         }
@@ -485,6 +497,83 @@ impl Motor {
             }
         }
 
+        found
+    }
+
+    /// Scan the CAN bus with progress callback.
+    ///
+    /// Calls `on_progress(current_index, total, motor_id)` for each probed ID.
+    /// This allows the caller to update a UI progress bar during scanning.
+    pub fn scan_bus_progressive<F>(
+        interface: &str,
+        host_id: u8,
+        id_range: std::ops::RangeInclusive<u8>,
+        timeout_per_id: Duration,
+        mut on_progress: F,
+    ) -> Vec<(u8, Option<Vec<u8>>)>
+    where
+        F: FnMut(usize, usize, u8),
+    {
+        let ids: Vec<u8> = id_range.collect();
+        let total = ids.len();
+
+        let socket = match CanSocket::open(interface) {
+            Ok(s) => s,
+            Err(e) => {
+                log::error!("Failed to open CAN socket '{}': {}", interface, e);
+                return vec![];
+            }
+        };
+        let _ = socket.set_read_timeout(timeout_per_id);
+
+        let mut found = Vec::new();
+
+        for (idx, &motor_id) in ids.iter().enumerate() {
+            on_progress(idx, total, motor_id);
+
+            let (can_id, data) = build_ping_frame(host_id, motor_id);
+
+            let ext_id = match ExtendedId::new(can_id) {
+                Some(id) => id,
+                None => continue,
+            };
+            let frame = match socketcan::CanFrame::new(ext_id, &data) {
+                Some(f) => f,
+                None => continue,
+            };
+
+            if socket.write_frame(&frame).is_err() {
+                continue;
+            }
+
+            let start = Instant::now();
+            while start.elapsed() < timeout_per_id {
+                match socket.read_frame() {
+                    Ok(resp) => {
+                        if !resp.is_extended() {
+                            continue;
+                        }
+                        let raw_id = match resp.id() {
+                            Id::Standard(sid) => StandardId::as_raw(&sid) as u32,
+                            Id::Extended(eid) => ExtendedId::as_raw(&eid),
+                        };
+                        let (ct, extra, dev_id) = parse_can_id(raw_id);
+                        let resp_motor_id = (extra & 0xFF) as u8;
+                        if dev_id == motor_id && ct == 0 {
+                            continue;
+                        }
+                        if resp_motor_id == motor_id || dev_id == motor_id {
+                            found.push((motor_id, Some(resp.data().to_vec())));
+                            break;
+                        }
+                    }
+                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                    Err(_) => break,
+                }
+            }
+        }
+
+        on_progress(total, total, 0);
         found
     }
 
