@@ -301,6 +301,16 @@ pub fn build_can_id(comm_type: CommType, extra_data: u16, device_id: u8) -> u32 
         | (device_id as u32)
 }
 
+/// Build a raw 29-bit extended CAN ID from already-decoded integer components.
+///
+/// Like `build_can_id` but takes `u8` for comm_type, useful when reconstructing
+/// from parsed values.
+pub fn build_can_id_raw(comm_type: u8, extra_data: u16, device_id: u8) -> u32 {
+    ((comm_type as u32) << 24)
+        | ((extra_data as u32) << 8)
+        | (device_id as u32)
+}
+
 /// Decode a 29-bit extended CAN ID.
 ///
 /// Returns (comm_type, extra_data, device_id).

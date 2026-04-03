@@ -14,6 +14,7 @@ use crossterm::ExecutableCommand;
 use ratatui::prelude::*;
 use ratatui::widgets::*;
 
+use robstride_sandbox::bilateral::{self, BilateralConfig, BilateralGains, BilateralMethod, SharedTelemetry, StopFlag};
 use robstride_sandbox::motor::Motor;
 use robstride_sandbox::protocol::{MotorFeedback, MotorModel, ParamIndex, RunMode};
 
@@ -58,10 +59,11 @@ enum Command {
     Spin,
     Torque,
     MitControl,
+    Bilateral,
 }
 
 impl Command {
-    const ALL: [Command; 13] = [
+    const ALL: [Command; 14] = [
         Command::Scan,
         Command::Ping,
         Command::Enable,
@@ -75,6 +77,7 @@ impl Command {
         Command::Spin,
         Command::Torque,
         Command::MitControl,
+        Command::Bilateral,
     ];
 
     fn label(&self) -> &'static str {
@@ -92,6 +95,7 @@ impl Command {
             Command::Spin => "Spin (Vel)",
             Command::Torque => "Torque",
             Command::MitControl => "MIT Control",
+            Command::Bilateral => "Bilateral Ctrl",
         }
     }
 
@@ -106,6 +110,7 @@ impl Command {
                 | Command::Spin
                 | Command::Torque
                 | Command::MitControl
+                | Command::Bilateral
         )
     }
 
@@ -119,6 +124,7 @@ impl Command {
             Command::Spin => "velocity_rad_s (e.g. 1.5)",
             Command::Torque => "torque_nm (e.g. 0.5)",
             Command::MitControl => "pos vel kp kd torque (e.g. 0 0 10 0.5 0)",
+            Command::Bilateral => "method [kp kd] (e.g. coupling 5.0 0.3)",
             _ => "",
         }
     }
@@ -161,6 +167,10 @@ struct App {
     scan_progress: Arc<Mutex<(usize, usize, bool)>>,
     /// Scan results collected from background thread
     scan_results: Arc<Mutex<Vec<(u8, Option<Vec<u8>>)>>>,
+    /// Bilateral control telemetry (if running)
+    bilateral_telemetry: Option<SharedTelemetry>,
+    /// Bilateral control stop flag (if running)
+    bilateral_stop: Option<StopFlag>,
 }
 
 impl App {
@@ -184,6 +194,8 @@ impl App {
             last_refresh: Instant::now(),
             scan_progress: Arc::new(Mutex::new((0, 0, false))),
             scan_results: Arc::new(Mutex::new(Vec::new())),
+            bilateral_telemetry: None,
+            bilateral_stop: None,
         }
     }
 
@@ -686,6 +698,95 @@ impl App {
         }
     }
 
+    fn execute_bilateral(&mut self, input: &str) {
+        // If already running, stop it
+        if self.bilateral_stop.is_some() {
+            self.stop_bilateral();
+            return;
+        }
+
+        // Parse: method [kp kd [force_scale] [inertia dob_cutoff]]
+        let parts: Vec<&str> = input.trim().split_whitespace().collect();
+        let method_str = if !parts.is_empty() { parts[0] } else { "coupling" };
+        let method = match BilateralMethod::from_short(method_str) {
+            Some(m) => m,
+            None => {
+                self.log_msg(format!(
+                    "Unknown method '{}'. Use: pos, force, coupling, mode",
+                    method_str
+                ));
+                return;
+            }
+        };
+
+        let mut gains = BilateralGains::default();
+        if parts.len() > 1 {
+            gains.kp = parts[1].parse().unwrap_or(gains.kp);
+        }
+        if parts.len() > 2 {
+            gains.kd = parts[2].parse().unwrap_or(gains.kd);
+        }
+        if parts.len() > 3 {
+            gains.force_scale = parts[3].parse().unwrap_or(gains.force_scale);
+        }
+        if parts.len() > 4 {
+            gains.inertia = parts[4].parse().unwrap_or(gains.inertia);
+        }
+        if parts.len() > 5 {
+            gains.dob_cutoff = parts[5].parse().unwrap_or(gains.dob_cutoff);
+        }
+
+        let config = BilateralConfig {
+            interface: self.interface.clone(),
+            host_id: self.host_id,
+            leader_id: 10,
+            follower_id: 1,
+            model: self.default_model,
+            method,
+            gains,
+            loop_period_us: 2000,
+        };
+
+        self.log_msg(format!(
+            "Starting bilateral control: {} (Kp={:.2}, Kd={:.2})",
+            method.label(),
+            gains.kp,
+            gains.kd,
+        ));
+        self.log_msg(format!(
+            "  Leader=ID:{}, Follower=ID:{}  Press Esc to stop.",
+            config.leader_id,
+            config.follower_id,
+        ));
+
+        match bilateral::launch_bilateral(config) {
+            Ok((telem, stop)) => {
+                self.bilateral_telemetry = Some(telem);
+                self.bilateral_stop = Some(stop);
+            }
+            Err(e) => {
+                self.log_msg(format!("Bilateral start failed: {}", e));
+            }
+        }
+    }
+
+    fn stop_bilateral(&mut self) {
+        if let Some(ref stop) = self.bilateral_stop {
+            stop.store(true, std::sync::atomic::Ordering::Relaxed);
+            self.log_msg("Bilateral control stopping...".to_string());
+        }
+        // Give the thread a moment to disable motors
+        std::thread::sleep(Duration::from_millis(100));
+        self.bilateral_telemetry = None;
+        self.bilateral_stop = None;
+        self.log_msg("Bilateral control stopped.".to_string());
+    }
+
+    /// Check if bilateral control is active.
+    fn bilateral_active(&self) -> bool {
+        self.bilateral_stop.is_some()
+    }
+
     fn execute_command(&mut self, cmd: Command, input: &str) {
         match cmd {
             Command::Scan => self.execute_scan(input),
@@ -701,6 +802,7 @@ impl App {
             Command::Spin => self.execute_spin(input),
             Command::Torque => self.execute_torque(input),
             Command::MitControl => self.execute_mit(input),
+            Command::Bilateral => self.execute_bilateral(input),
         }
     }
 
@@ -741,7 +843,17 @@ impl App {
             return;
         }
         if key.code == KeyCode::Char('q') && !self.input_mode {
+            if self.bilateral_active() {
+                self.stop_bilateral();
+                return;
+            }
             self.quit = true;
+            return;
+        }
+
+        // Esc stops bilateral control if running (outside input mode)
+        if key.code == KeyCode::Esc && !self.input_mode && self.bilateral_active() {
+            self.stop_bilateral();
             return;
         }
 
@@ -866,6 +978,11 @@ fn ui(frame: &mut Frame, app: &App) {
     render_log(frame, app, bottom_chunks[0]);
     if app.input_mode {
         render_input(frame, app, bottom_chunks[1]);
+    }
+
+    // Overlay bilateral telemetry if active
+    if app.bilateral_active() {
+        render_bilateral_overlay(frame, app);
     }
 
     // Overlay scan progress bar if scanning
@@ -1091,6 +1208,92 @@ fn render_input(frame: &mut Frame, app: &App, area: Rect) {
 
 }
 
+fn render_bilateral_overlay(frame: &mut Frame, app: &App) {
+    let telem = match &app.bilateral_telemetry {
+        Some(t) => match t.lock() {
+            Ok(t) => t.clone(),
+            Err(_) => return,
+        },
+        None => return,
+    };
+
+    let method_name = telem
+        .method
+        .map(|m| m.label())
+        .unwrap_or("???");
+
+    let text = vec![
+        Line::from(vec![
+            Span::styled(" Method: ", Style::default().fg(Color::Yellow)),
+            Span::styled(method_name, Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+            Span::raw("    "),
+            Span::styled(format!("Loop: {:.0} Hz", telem.loop_hz), Style::default().fg(Color::Cyan)),
+            Span::raw("    "),
+            Span::styled(format!("Cycles: {}", telem.cycle_count), Style::default().fg(Color::DarkGray)),
+        ]),
+        Line::from(vec![
+            Span::styled(" Leader  (10): ", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+            Span::raw(format!(
+                "pos={:>8.3}  vel={:>8.3}  τcmd={:>7.3}",
+                telem.leader_pos, telem.leader_vel, telem.leader_torque_cmd,
+            )),
+        ]),
+        Line::from(vec![
+            Span::styled(" Follow  ( 1): ", Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD)),
+            Span::raw(format!(
+                "pos={:>8.3}  vel={:>8.3}  τcmd={:>7.3}",
+                telem.follower_pos, telem.follower_vel, telem.follower_torque_cmd,
+            )),
+        ]),
+        Line::from(vec![
+            Span::styled(" Δpos: ", Style::default().fg(Color::Yellow)),
+            Span::styled(
+                format!("{:>8.4} rad", telem.position_error),
+                if telem.position_error.abs() > 0.5 {
+                    Style::default().fg(Color::Red)
+                } else {
+                    Style::default().fg(Color::White)
+                },
+            ),
+            Span::raw("    "),
+            Span::styled(
+                match &telem.last_error {
+                    Some(e) => format!("ERR: {}", e),
+                    None => "OK".to_string(),
+                },
+                if telem.last_error.is_some() {
+                    Style::default().fg(Color::Red)
+                } else {
+                    Style::default().fg(Color::Green)
+                },
+            ),
+        ]),
+        Line::from(Span::styled(
+            " Press Esc or q to stop bilateral control ",
+            Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
+        )),
+    ];
+
+    let area = frame.area();
+    let overlay_height = (text.len() + 2) as u16; // +2 for borders
+    let overlay_width = 70.min(area.width.saturating_sub(4));
+    let overlay_area = Rect {
+        x: (area.width.saturating_sub(overlay_width)) / 2,
+        y: area.height.saturating_sub(overlay_height + 1),
+        width: overlay_width,
+        height: overlay_height,
+    };
+
+    let paragraph = Paragraph::new(text).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(" Bilateral Control ")
+            .border_style(Style::default().fg(Color::Yellow)),
+    );
+
+    frame.render_widget(Clear, overlay_area);
+    frame.render_widget(paragraph, overlay_area);
+}
 // =============================================================================
 // Helpers
 // =============================================================================
@@ -1218,6 +1421,10 @@ fn main() -> Result<()> {
         }
 
         if app.quit {
+            // Stop bilateral control if running
+            if app.bilateral_active() {
+                app.stop_bilateral();
+            }
             // Disable all enabled motors before quitting
             for entry in &app.motors {
                 if entry.enabled {

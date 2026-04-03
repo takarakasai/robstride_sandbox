@@ -25,6 +25,7 @@
 //! # Ok::<(), anyhow::Error>(())
 //! ```
 
+pub mod bilateral;
 pub mod error;
 pub mod motor;
 pub mod protocol;
