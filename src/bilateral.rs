@@ -93,6 +93,20 @@ pub struct BilateralGains {
     pub coulomb_friction: f64,
     /// Viscous friction coefficient [Nm·s/rad] (friction proportional to velocity)
     pub viscous_friction: f64,
+    /// Leader inertia compensation ratio [0.0 - 1.0]
+    /// 0.0 = no compensation, 1.0 = full cancellation of motor inertia
+    pub inertia_comp: f64,
+    /// LPF cutoff for acceleration estimation [rad/s] (for inertia comp)
+    pub accel_cutoff: f64,
+    /// Leader motor-internal kd for velocity assist [Nm·s/rad]
+    /// Uses the motor's built-in MIT kd (runs at motor rate ~10kHz)
+    /// to provide active backdrive assist, overcoming gearbox friction/inertia.
+    /// 0.0 = disabled, typical: 0.1-0.5
+    pub assist_kd: f64,
+    /// Velocity reference lookahead factor for leader assist.
+    /// vel_ref = measured_vel * vel_ahead.
+    /// 1.5-3.0 typical. Higher = more aggressive assist.
+    pub vel_ahead: f64,
 }
 
 impl Default for BilateralGains {
@@ -105,6 +119,10 @@ impl Default for BilateralGains {
             dob_cutoff: 100.0,
             coulomb_friction: 0.05,
             viscous_friction: 0.01,
+            inertia_comp: 0.0,
+            accel_cutoff: 50.0,
+            assist_kd: 0.0,
+            vel_ahead: 2.0,
         }
     }
 }
@@ -132,6 +150,10 @@ pub struct BilateralTelemetry {
     pub leader_friction_comp: f64,
     /// Follower friction compensation torque [Nm]
     pub follower_friction_comp: f64,
+    /// Leader inertia compensation torque [Nm]
+    pub leader_inertia_comp: f64,
+    /// Leader velocity assist (motor-internal kd contribution) [Nm]
+    pub leader_vel_assist: f64,
     /// Number of control cycles executed
     pub cycle_count: u64,
     /// Active method
@@ -355,12 +377,20 @@ impl Default for BilateralConfig {
 ///
 /// A small dead zone (|ω| < 0.01) avoids sign chatter at zero velocity.
 fn friction_compensation(velocity: f64, coulomb: f64, viscous: f64) -> f64 {
-    let sign = if velocity.abs() < 0.01 {
+    // Deadband 0.05 rad/s to avoid step torque from velocity noise
+    let sign = if velocity.abs() < 0.05 {
         0.0
     } else {
         velocity.signum()
     };
     coulomb * sign + viscous * velocity
+}
+
+/// Soft-start ramp: linearly ramps from 0 to 1 over `ramp_secs`.
+const SOFT_START_SECS: f64 = 2.0;
+
+fn soft_start_gain(elapsed_secs: f64) -> f64 {
+    (elapsed_secs / SOFT_START_SECS).clamp(0.0, 1.0)
 }
 
 /// Launch the bilateral control loop in a background thread.
@@ -429,14 +459,21 @@ fn run_bilateral_loop(
     let kd = config.gains.kd;
     let coulomb = config.gains.coulomb_friction;
     let viscous = config.gains.viscous_friction;
+    let inertia_comp_ratio = config.gains.inertia_comp.clamp(0.0, 1.0);
+    let j_comp = config.gains.inertia * inertia_comp_ratio;
     let loop_period = Duration::from_micros(config.loop_period_us);
     let mut cycle: u64 = 0;
     let mut loop_start = Instant::now();
     let mut hz_accum = 0.0;
     let mut hz_count = 0u32;
 
+    // Leader acceleration estimator: LPF on dω/dt
+    let mut leader_prev_vel = prev_l_vel;
+    let mut accel_lpf = LowPassFilter::new(config.gains.accel_cutoff);
+
     // Clamp torque to motor limits
-    let torque_limit = scales.torque * 0.8; // leave 20% margin
+    let torque_limit = scales.torque * 0.5; // leave 50% margin for safety
+    let start_time = Instant::now();
 
     loop {
         if stop.load(Ordering::Relaxed) {
@@ -444,6 +481,7 @@ fn run_bilateral_loop(
         }
 
         let iter_start = Instant::now();
+        let ramp = soft_start_gain(start_time.elapsed().as_secs_f64());
         let dt = if cycle == 0 {
             loop_period.as_secs_f64()
         } else {
@@ -507,17 +545,55 @@ fn run_bilateral_loop(
         let friction_comp_l = friction_compensation(prev_l_vel, coulomb, viscous);
         let friction_comp_f = friction_compensation(prev_f_vel, coulomb, viscous);
 
-        let tau_leader_total = tau_leader + friction_comp_l;
-        let tau_follower_total = tau_follower + friction_comp_f;
+        // Leader inertia compensation: τ = -J_comp · α_filtered
+        // This makes the leader feel lighter by cancelling its own inertia.
+        let raw_accel = if dt > 0.0 {
+            (prev_l_vel - leader_prev_vel) / dt
+        } else {
+            0.0
+        };
+        leader_prev_vel = prev_l_vel;
+        let filtered_accel = accel_lpf.update(raw_accel, dt);
+        let inertia_comp_torque = -j_comp * filtered_accel;
+
+        // Apply soft-start ramp to all compensation torques
+        let tau_leader_total = tau_leader + (friction_comp_l + inertia_comp_torque) * ramp;
+        let tau_follower_total = tau_follower + friction_comp_f * ramp;
 
         // Clamp
         let tau_leader_clamped = tau_leader_total.clamp(-torque_limit, torque_limit);
         let tau_follower_clamped = tau_follower_total.clamp(-torque_limit, torque_limit);
 
-        // Send MIT commands (kp=0, kd=0, torque feedforward only)
+        // =====================================================================
+        // Leader: use motor-internal kd for velocity assist
+        // =====================================================================
+        // Instead of kp=0, kd=0, τ_ff=everything:
+        //   kp=0, kd=assist_kd, vel_ref=vel*vel_ahead, τ_ff=coupling+friction
+        //
+        // Motor internally computes:
+        //   τ_motor = kd*(vel_ref - vel_actual) + τ_ff
+        //           ≈ assist_kd*(vel_ahead-1)*vel + τ_ff
+        //
+        // This "negative damping" runs at motor's internal rate (~10kHz),
+        // providing much faster assist than CAN-rate feedforward.
+        let (mit_kd_leader, mit_vel_leader) = if config.gains.assist_kd > 0.0 {
+            // vel_ref slightly ahead of current velocity → motor assists motion
+            // Ramp up kd for safety during soft-start
+            let vel_ref = prev_l_vel * config.gains.vel_ahead;
+            (config.gains.assist_kd * ramp, vel_ref)
+        } else {
+            (0.0, 0.0)
+        };
+        let leader_vel_assist_est = if config.gains.assist_kd > 0.0 {
+            config.gains.assist_kd * ramp * (config.gains.vel_ahead - 1.0) * prev_l_vel
+        } else {
+            0.0
+        };
+
+        // Send MIT commands
         let fb_l = match mit_exchange(
             &socket, host, lid, &scales,
-            0.0, 0.0, 0.0, 0.0, tau_leader_clamped,
+            0.0, mit_vel_leader, 0.0, mit_kd_leader, tau_leader_clamped,
         ) {
             Ok(fb) => fb,
             Err(_e) => {
@@ -574,6 +650,8 @@ fn run_bilateral_loop(
                 t.position_error = fb_l.position - fb_f.position;
                 t.leader_friction_comp = friction_comp_l;
                 t.follower_friction_comp = friction_comp_f;
+                t.leader_inertia_comp = inertia_comp_torque;
+                t.leader_vel_assist = leader_vel_assist_est;
                 t.cycle_count = cycle;
                 if hz_count > 0 {
                     t.loop_hz = hz_accum / hz_count as f64;
@@ -597,5 +675,209 @@ fn run_bilateral_loop(
     let _ = can_disable(&socket, host, lid);
     let _ = can_disable(&socket, host, fid);
 
+    Ok(())
+}
+
+// =============================================================================
+// Single-motor Assist Test
+// =============================================================================
+
+/// Configuration for the single-motor assist test.
+#[derive(Debug, Clone)]
+pub struct AssistTestConfig {
+    pub interface: String,
+    pub host_id: u8,
+    pub motor_id: u8,
+    pub model: MotorModel,
+    /// Motor-internal kd for velocity assist
+    pub assist_kd: f64,
+    /// Velocity reference lookahead factor
+    pub vel_ahead: f64,
+    /// Coulomb friction compensation [Nm]
+    pub coulomb_friction: f64,
+    /// Viscous friction compensation [Nm·s/rad]
+    pub viscous_friction: f64,
+    /// Motor inertia [kg·m²] (for CAN-side inertia comp)
+    pub inertia: f64,
+    /// Inertia compensation ratio [0-1]
+    pub inertia_comp: f64,
+    /// Acceleration LPF cutoff [rad/s]
+    pub accel_cutoff: f64,
+    /// Target loop period [µs]
+    pub loop_period_us: u64,
+}
+
+impl Default for AssistTestConfig {
+    fn default() -> Self {
+        AssistTestConfig {
+            interface: "can0".to_string(),
+            host_id: 0xFD,
+            motor_id: 10,
+            model: MotorModel::Rs05,
+            assist_kd: 0.0,
+            vel_ahead: 2.0,
+            coulomb_friction: 0.0,
+            viscous_friction: 0.0,
+            inertia: 0.005,
+            inertia_comp: 0.0,
+            accel_cutoff: 50.0,
+            loop_period_us: 2000,
+        }
+    }
+}
+
+/// Launch the single-motor assist test loop in a background thread.
+///
+/// Returns (telemetry_handle, stop_flag).
+/// Telemetry uses the same BilateralTelemetry struct (follower fields stay zero).
+pub fn launch_assist_test(
+    config: AssistTestConfig,
+) -> Result<(SharedTelemetry, StopFlag)> {
+    let telemetry = Arc::new(Mutex::new(BilateralTelemetry {
+        method: None, // indicates assist-test mode
+        ..Default::default()
+    }));
+    let stop = Arc::new(AtomicBool::new(false));
+
+    let telem = Arc::clone(&telemetry);
+    let stop_flag = Arc::clone(&stop);
+
+    std::thread::spawn(move || {
+        if let Err(e) = run_assist_test_loop(&config, &telem, &stop_flag) {
+            if let Ok(mut t) = telem.lock() {
+                t.last_error = Some(format!("Assist test error: {}", e));
+            }
+        }
+    });
+
+    Ok((telemetry, stop))
+}
+
+fn run_assist_test_loop(
+    config: &AssistTestConfig,
+    telemetry: &SharedTelemetry,
+    stop: &StopFlag,
+) -> Result<()> {
+    let socket = CanSocket::open(&config.interface)?;
+    socket.set_read_timeout(Duration::from_millis(10))?;
+
+    let scales = MitScales::for_model(config.model);
+    let host = config.host_id;
+    let mid = config.motor_id;
+
+    // Enable motor
+    can_enable(&socket, host, mid)?;
+    std::thread::sleep(Duration::from_millis(20));
+
+    // Initial status read
+    let fb = mit_exchange(&socket, host, mid, &scales, 0.0, 0.0, 0.0, 0.0, 0.0)?;
+    let mut prev_vel = fb.velocity;
+    let mut prev_prev_vel = prev_vel;
+
+    let coulomb = config.coulomb_friction;
+    let viscous = config.viscous_friction;
+    let j_comp = config.inertia * config.inertia_comp.clamp(0.0, 1.0);
+    let loop_period = Duration::from_micros(config.loop_period_us);
+
+    let mut accel_lpf = LowPassFilter::new(config.accel_cutoff);
+    let mut cycle: u64 = 0;
+    let mut loop_start = Instant::now();
+    let mut hz_accum = 0.0;
+    let mut hz_count = 0u32;
+
+    let torque_limit = scales.torque * 0.5; // leave 50% margin for safety
+    let start_time = Instant::now();
+
+    loop {
+        if stop.load(Ordering::Relaxed) {
+            break;
+        }
+
+        let iter_start = Instant::now();
+        let ramp = soft_start_gain(start_time.elapsed().as_secs_f64());
+        let dt = if cycle == 0 {
+            loop_period.as_secs_f64()
+        } else {
+            iter_start.duration_since(loop_start).as_secs_f64().max(0.0001)
+        };
+        loop_start = iter_start;
+
+        // Friction compensation
+        let friction_comp = friction_compensation(prev_vel, coulomb, viscous);
+
+        // CAN-side inertia compensation
+        let raw_accel = if dt > 0.0 {
+            (prev_vel - prev_prev_vel) / dt
+        } else {
+            0.0
+        };
+        prev_prev_vel = prev_vel;
+        let filtered_accel = accel_lpf.update(raw_accel, dt);
+        let inertia_comp_torque = -j_comp * filtered_accel;
+
+        // Total CAN-side feedforward torque (with soft-start ramp)
+        let tau_ff = ((friction_comp + inertia_comp_torque) * ramp).clamp(-torque_limit, torque_limit);
+
+        // Motor-internal velocity assist (with soft-start ramp)
+        let (mit_kd, mit_vel) = if config.assist_kd > 0.0 {
+            (config.assist_kd * ramp, prev_vel * config.vel_ahead)
+        } else {
+            (0.0, 0.0)
+        };
+        let vel_assist_est = if config.assist_kd > 0.0 {
+            config.assist_kd * ramp * (config.vel_ahead - 1.0) * prev_vel
+        } else {
+            0.0
+        };
+
+        // Send MIT command
+        let fb = match mit_exchange(
+            &socket, host, mid, &scales,
+            0.0, mit_vel, 0.0, mit_kd, tau_ff,
+        ) {
+            Ok(fb) => fb,
+            Err(_e) => {
+                cycle += 1;
+                continue;
+            }
+        };
+
+        prev_vel = fb.velocity;
+
+        // Loop frequency
+        let elapsed = iter_start.elapsed().as_secs_f64();
+        if elapsed > 0.0 {
+            hz_accum += 1.0 / elapsed;
+            hz_count += 1;
+        }
+
+        // Update telemetry
+        if cycle % 10 == 0 {
+            if let Ok(mut t) = telemetry.lock() {
+                t.leader_pos = fb.position;
+                t.leader_vel = fb.velocity;
+                t.leader_torque_cmd = tau_ff;
+                t.leader_friction_comp = friction_comp;
+                t.leader_inertia_comp = inertia_comp_torque;
+                t.leader_vel_assist = vel_assist_est;
+                t.cycle_count = cycle;
+                if hz_count > 0 {
+                    t.loop_hz = hz_accum / hz_count as f64;
+                    hz_accum = 0.0;
+                    hz_count = 0;
+                }
+                t.last_error = None;
+            }
+        }
+
+        cycle += 1;
+
+        let work_time = iter_start.elapsed();
+        if work_time < loop_period {
+            std::thread::sleep(loop_period - work_time);
+        }
+    }
+
+    let _ = can_disable(&socket, host, mid);
     Ok(())
 }

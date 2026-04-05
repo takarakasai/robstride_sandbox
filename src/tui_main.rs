@@ -14,7 +14,7 @@ use crossterm::ExecutableCommand;
 use ratatui::prelude::*;
 use ratatui::widgets::*;
 
-use robstride_sandbox::bilateral::{self, BilateralConfig, BilateralGains, BilateralMethod, SharedTelemetry, StopFlag};
+use robstride_sandbox::bilateral::{self, AssistTestConfig, BilateralConfig, BilateralGains, BilateralMethod, SharedTelemetry, StopFlag};
 use robstride_sandbox::motor::Motor;
 use robstride_sandbox::protocol::{MotorFeedback, MotorModel, ParamIndex, RunMode};
 
@@ -122,9 +122,23 @@ fn params_for_command(cmd: Command) -> Vec<ParamField> {
             ParamField::new("kd", "0.3", "Damping [Nm·s/rad]"),
             ParamField::new("coulomb", "0.05", "Coulomb friction comp [Nm]"),
             ParamField::new("viscous", "0.01", "Viscous friction comp [Nm·s/rad]"),
-            ParamField::new("force_sc", "0.5", "Force reflection scale (force method)"),
-            ParamField::new("inertia", "0.005", "Motor inertia [kg·m²] (mode method)"),
+            ParamField::new("force_sc", "0.5", "Force refl scale (force method)"),
+            ParamField::new("inertia", "0.005", "Motor inertia [kg·m²]"),
             ParamField::new("dob_cut", "100.0", "DOB cutoff [rad/s] (mode method)"),
+            ParamField::new("iner_comp", "0.0", "Leader inertia FF comp [0-1]"),
+            ParamField::new("acc_cut", "50.0", "Accel LPF cutoff [rad/s]"),
+            ParamField::new("assist_kd", "0.3", "Leader motor-internal kd assist"),
+            ParamField::new("vel_ahead", "2.0", "Vel ref lookahead (1=off, 2-3 typ)"),
+        ],
+        Command::AssistTest => vec![
+            ParamField::new("motor_id", "10", "Motor CAN ID to test"),
+            ParamField::new("assist_kd", "0.0", "Motor-internal kd assist [Nm·s/rad] (0=off)"),
+            ParamField::new("vel_ahead", "2.0", "Vel ref lookahead (1=off, 2-3 typ)"),
+            ParamField::new("coulomb", "0.0", "Coulomb friction comp [Nm] (0=off)"),
+            ParamField::new("viscous", "0.0", "Viscous friction comp [Nm·s/rad] (0=off)"),
+            ParamField::new("inertia", "0.005", "Motor inertia [kg·m²]"),
+            ParamField::new("iner_comp", "0.0", "Inertia FF comp ratio [0-1] (0=off)"),
+            ParamField::new("acc_cut", "50.0", "Accel LPF cutoff [rad/s]"),
         ],
         // Commands with no parameters
         _ => vec![],
@@ -148,10 +162,11 @@ enum Command {
     Torque,
     MitControl,
     Bilateral,
+    AssistTest,
 }
 
 impl Command {
-    const ALL: [Command; 14] = [
+    const ALL: [Command; 15] = [
         Command::Scan,
         Command::Ping,
         Command::Enable,
@@ -166,6 +181,7 @@ impl Command {
         Command::Torque,
         Command::MitControl,
         Command::Bilateral,
+        Command::AssistTest,
     ];
 
     fn label(&self) -> &'static str {
@@ -184,6 +200,7 @@ impl Command {
             Command::Torque => "Torque",
             Command::MitControl => "MIT Control",
             Command::Bilateral => "Bilateral Ctrl",
+            Command::AssistTest => "Assist Test",
         }
     }
 
@@ -772,6 +789,48 @@ impl App {
         }
     }
 
+    fn execute_assist_test(&mut self, input: &str) {
+        // If already running, stop it
+        if self.bilateral_stop.is_some() {
+            self.stop_bilateral();
+            return;
+        }
+
+        let parts: Vec<&str> = input.trim().split_whitespace().collect();
+        let mut cfg = AssistTestConfig {
+            interface: self.interface.clone(),
+            host_id: self.host_id,
+            model: self.default_model,
+            ..Default::default()
+        };
+        if parts.len() > 0 { cfg.motor_id = parts[0].parse().unwrap_or(cfg.motor_id); }
+        if parts.len() > 1 { cfg.assist_kd = parts[1].parse().unwrap_or(cfg.assist_kd); }
+        if parts.len() > 2 { cfg.vel_ahead = parts[2].parse().unwrap_or(cfg.vel_ahead); }
+        if parts.len() > 3 { cfg.coulomb_friction = parts[3].parse().unwrap_or(cfg.coulomb_friction); }
+        if parts.len() > 4 { cfg.viscous_friction = parts[4].parse().unwrap_or(cfg.viscous_friction); }
+        if parts.len() > 5 { cfg.inertia = parts[5].parse().unwrap_or(cfg.inertia); }
+        if parts.len() > 6 { cfg.inertia_comp = parts[6].parse().unwrap_or(cfg.inertia_comp); }
+        if parts.len() > 7 { cfg.accel_cutoff = parts[7].parse().unwrap_or(cfg.accel_cutoff); }
+
+        self.log_msg(format!(
+            "Starting Assist Test: ID={}, kd={:.2}, vel_ah={:.1}, Cf={:.3}, Vf={:.3}, J={:.4}, IC={:.1}, AC={:.0}",
+            cfg.motor_id, cfg.assist_kd, cfg.vel_ahead,
+            cfg.coulomb_friction, cfg.viscous_friction,
+            cfg.inertia, cfg.inertia_comp, cfg.accel_cutoff,
+        ));
+        self.log_msg("Press Esc to stop.".to_string());
+
+        match bilateral::launch_assist_test(cfg) {
+            Ok((telem, stop)) => {
+                self.bilateral_telemetry = Some(telem);
+                self.bilateral_stop = Some(stop);
+            }
+            Err(e) => {
+                self.log_msg(format!("Assist test start failed: {}", e));
+            }
+        }
+    }
+
     fn execute_bilateral(&mut self, input: &str) {
         // If already running, stop it
         if self.bilateral_stop.is_some() {
@@ -814,6 +873,18 @@ impl App {
         }
         if parts.len() > 7 {
             gains.dob_cutoff = parts[7].parse().unwrap_or(gains.dob_cutoff);
+        }
+        if parts.len() > 8 {
+            gains.inertia_comp = parts[8].parse().unwrap_or(gains.inertia_comp);
+        }
+        if parts.len() > 9 {
+            gains.accel_cutoff = parts[9].parse().unwrap_or(gains.accel_cutoff);
+        }
+        if parts.len() > 10 {
+            gains.assist_kd = parts[10].parse().unwrap_or(gains.assist_kd);
+        }
+        if parts.len() > 11 {
+            gains.vel_ahead = parts[11].parse().unwrap_or(gains.vel_ahead);
         }
 
         let config = BilateralConfig {
@@ -885,6 +956,7 @@ impl App {
             Command::Torque => self.execute_torque(input),
             Command::MitControl => self.execute_mit(input),
             Command::Bilateral => self.execute_bilateral(input),
+            Command::AssistTest => self.execute_assist_test(input),
         }
     }
 
@@ -1152,26 +1224,14 @@ fn ui(frame: &mut Frame, app: &App) {
         .split(frame.area());
 
     // Top area: motors (left) | commands (center) | params (right)
-    let cmd = Command::ALL[app.selected_cmd];
-    let top_chunks = if cmd.has_params() {
-        Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([
-                Constraint::Percentage(45),
-                Constraint::Percentage(18),
-                Constraint::Percentage(37),
-            ])
-            .split(main_chunks[0])
-    } else {
-        Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([
-                Constraint::Percentage(65),
-                Constraint::Percentage(35),
-                Constraint::Length(0),
-            ])
-            .split(main_chunks[0])
-    };
+    let top_chunks = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage(45),
+            Constraint::Percentage(18),
+            Constraint::Percentage(37),
+        ])
+        .split(main_chunks[0]);
 
     // Bottom area: log (full width), possibly with input bar
     let bottom_chunks = if app.input_mode {
@@ -1188,9 +1248,7 @@ fn ui(frame: &mut Frame, app: &App) {
 
     render_motors(frame, app, top_chunks[0]);
     render_commands(frame, app, top_chunks[1]);
-    if cmd.has_params() {
-        render_params(frame, app, top_chunks[2]);
-    }
+    render_params(frame, app, top_chunks[2]);
     render_log(frame, app, bottom_chunks[0]);
     if app.input_mode {
         render_input(frame, app, bottom_chunks[1]);
@@ -1554,14 +1612,20 @@ fn render_bilateral_overlay(frame: &mut Frame, app: &App) {
         None => return,
     };
 
+    let is_assist_test = telem.method.is_none();
     let method_name = telem
         .method
         .map(|m| m.label())
-        .unwrap_or("???");
+        .unwrap_or("Assist Test");
+    let overlay_title = if is_assist_test {
+        " Assist Test "
+    } else {
+        " Bilateral Control "
+    };
 
-    let text = vec![
+    let mut text = vec![
         Line::from(vec![
-            Span::styled(" Method: ", Style::default().fg(Color::Yellow)),
+            Span::styled(" Mode: ", Style::default().fg(Color::Yellow)),
             Span::styled(method_name, Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
             Span::raw("    "),
             Span::styled(format!("Loop: {:.0} Hz", telem.loop_hz), Style::default().fg(Color::Cyan)),
@@ -1569,20 +1633,26 @@ fn render_bilateral_overlay(frame: &mut Frame, app: &App) {
             Span::styled(format!("Cycles: {}", telem.cycle_count), Style::default().fg(Color::DarkGray)),
         ]),
         Line::from(vec![
-            Span::styled(" Leader  (10): ", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                if is_assist_test { " Motor:       " } else { " Leader  (10): " },
+                Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+            ),
             Span::raw(format!(
                 "pos={:>8.3}  vel={:>8.3}  τcmd={:>7.3}",
                 telem.leader_pos, telem.leader_vel, telem.leader_torque_cmd,
             )),
         ]),
-        Line::from(vec![
+    ];
+
+    if !is_assist_test {
+        text.push(Line::from(vec![
             Span::styled(" Follow  ( 1): ", Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD)),
             Span::raw(format!(
                 "pos={:>8.3}  vel={:>8.3}  τcmd={:>7.3}",
                 telem.follower_pos, telem.follower_vel, telem.follower_torque_cmd,
             )),
-        ]),
-        Line::from(vec![
+        ]));
+        text.push(Line::from(vec![
             Span::styled(" Δpos: ", Style::default().fg(Color::Yellow)),
             Span::styled(
                 format!("{:>8.4} rad", telem.position_error),
@@ -1598,26 +1668,44 @@ fn render_bilateral_overlay(frame: &mut Frame, app: &App) {
                 "L={:>6.3} F={:>6.3}",
                 telem.leader_friction_comp, telem.follower_friction_comp,
             )),
-        ]),
-        Line::from(vec![
-            Span::raw(" "),
-            Span::styled(
-                match &telem.last_error {
-                    Some(e) => format!("ERR: {}", e),
-                    None => "OK".to_string(),
-                },
-                if telem.last_error.is_some() {
-                    Style::default().fg(Color::Red)
-                } else {
-                    Style::default().fg(Color::Green)
-                },
-            ),
-        ]),
-        Line::from(Span::styled(
-            " Press Esc or q to stop bilateral control ",
-            Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
-        )),
-    ];
+            Span::raw("  "),
+            Span::styled("InrComp: ", Style::default().fg(Color::DarkGray)),
+            Span::raw(format!("{:>6.3}", telem.leader_inertia_comp)),
+            Span::raw("  "),
+            Span::styled("VelAst: ", Style::default().fg(Color::DarkGray)),
+            Span::raw(format!("{:>6.3}", telem.leader_vel_assist)),
+        ]));
+    } else {
+        text.push(Line::from(vec![
+            Span::styled(" FrComp: ", Style::default().fg(Color::DarkGray)),
+            Span::raw(format!("{:>6.3}", telem.leader_friction_comp)),
+            Span::raw("  "),
+            Span::styled("InrComp: ", Style::default().fg(Color::DarkGray)),
+            Span::raw(format!("{:>6.3}", telem.leader_inertia_comp)),
+            Span::raw("  "),
+            Span::styled("VelAst: ", Style::default().fg(Color::DarkGray)),
+            Span::raw(format!("{:>6.3}", telem.leader_vel_assist)),
+        ]));
+    }
+
+    text.push(Line::from(vec![
+        Span::raw(" "),
+        Span::styled(
+            match &telem.last_error {
+                Some(e) => format!("ERR: {}", e),
+                None => "OK".to_string(),
+            },
+            if telem.last_error.is_some() {
+                Style::default().fg(Color::Red)
+            } else {
+                Style::default().fg(Color::Green)
+            },
+        ),
+    ]));
+    text.push(Line::from(Span::styled(
+        " Press Esc or q to stop ",
+        Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
+    )));
 
     let area = frame.area();
     let overlay_height = (text.len() + 2) as u16; // +2 for borders
@@ -1632,7 +1720,7 @@ fn render_bilateral_overlay(frame: &mut Frame, app: &App) {
     let paragraph = Paragraph::new(text).block(
         Block::default()
             .borders(Borders::ALL)
-            .title(" Bilateral Control ")
+            .title(overlay_title)
             .border_style(Style::default().fg(Color::Yellow)),
     );
 
