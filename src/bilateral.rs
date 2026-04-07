@@ -1,11 +1,12 @@
 //! Bilateral control implementations for dual-motor haptic teleoperation.
 //!
-//! Four methods are provided:
+//! Five methods are provided:
 //!
 //! 1. **Position Mirroring** – Follower tracks leader position. No force feedback.
 //! 2. **Force-Reflecting** – Follower tracks leader position; leader feels follower reaction force.
 //! 3. **Virtual Coupling** – Symmetric virtual spring-damper between the two motors.
 //! 4. **Mode-Space (4ch)** – Differential/common mode decomposition with observers.
+//! 5. **On-Demand** – Leader stays OFF (free); force-feedback only when follower detects contact.
 //!
 //! All methods run a real-time control loop that communicates with two motors
 //! over CAN bus using MIT mode.
@@ -36,14 +37,17 @@ pub enum BilateralMethod {
     VirtualCoupling,
     /// 4: Mode-space (4ch) bilateral with observer-based force estimation.
     ModeSpace,
+    /// 5: Leader stays disabled (free); force feedback on follower contact.
+    OnDemand,
 }
 
 impl BilateralMethod {
-    pub const ALL: [BilateralMethod; 4] = [
+    pub const ALL: [BilateralMethod; 5] = [
         BilateralMethod::PositionMirroring,
         BilateralMethod::ForceReflecting,
         BilateralMethod::VirtualCoupling,
         BilateralMethod::ModeSpace,
+        BilateralMethod::OnDemand,
     ];
 
     pub fn label(&self) -> &'static str {
@@ -52,6 +56,7 @@ impl BilateralMethod {
             BilateralMethod::ForceReflecting => "Force Reflecting",
             BilateralMethod::VirtualCoupling => "Virtual Coupling",
             BilateralMethod::ModeSpace => "Mode Space (4ch)",
+            BilateralMethod::OnDemand => "On-Demand",
         }
     }
 
@@ -61,6 +66,7 @@ impl BilateralMethod {
             BilateralMethod::ForceReflecting => "force",
             BilateralMethod::VirtualCoupling => "coupling",
             BilateralMethod::ModeSpace => "mode",
+            BilateralMethod::OnDemand => "ondemand",
         }
     }
 
@@ -71,6 +77,7 @@ impl BilateralMethod {
             "force" | "2" => Some(Self::ForceReflecting),
             "coupling" | "virtual" | "3" => Some(Self::VirtualCoupling),
             "mode" | "4ch" | "4" => Some(Self::ModeSpace),
+            "ondemand" | "demand" | "od" | "5" => Some(Self::OnDemand),
             _ => None,
         }
     }
@@ -112,6 +119,10 @@ pub struct BilateralGains {
     /// The vel_ref delta is clamped so kd*(vel_ref - vel) <= max_assist.
     /// 0.05 Nm typical (should be less than mechanical friction).
     pub max_assist: f64,
+    /// Force threshold for OnDemand mode [Nm].
+    /// Leader is enabled only when |follower_torque| > this value.
+    /// Hysteresis: disables when < threshold * 0.5.
+    pub force_threshold: f64,
 }
 
 impl Default for BilateralGains {
@@ -129,6 +140,7 @@ impl Default for BilateralGains {
             assist_kd: 0.0,
             vel_ahead: 2.0,
             max_assist: 0.05,
+            force_threshold: 0.3,
         }
     }
 }
@@ -261,6 +273,19 @@ fn can_disable(socket: &CanSocket, host_id: u8, motor_id: u8) -> Result<()> {
 #[allow(dead_code)]
 fn can_read_current(socket: &CanSocket, host_id: u8, motor_id: u8) -> Result<f32> {
     let (can_id, data) = build_read_param_frame(host_id, motor_id, ParamIndex::IqFilt);
+    send_can(socket, can_id, &data)?;
+    let deadline = Instant::now() + Duration::from_millis(20);
+    loop {
+        let (_ct, _extra, _dev, rdata) = recv_can(socket, deadline.duration_since(Instant::now()).max(Duration::from_millis(1)))?;
+        if let Some((_idx, val)) = parse_param_response(&rdata) {
+            return Ok(val);
+        }
+    }
+}
+
+/// Read a single float parameter from a motor (works even when disabled).
+fn can_read_param(socket: &CanSocket, host_id: u8, motor_id: u8, param: ParamIndex) -> Result<f32> {
+    let (can_id, data) = build_read_param_frame(host_id, motor_id, param);
     send_can(socket, can_id, &data)?;
     let deadline = Instant::now() + Duration::from_millis(20);
     loop {
@@ -415,7 +440,12 @@ pub fn launch_bilateral(
     let stop_flag = Arc::clone(&stop);
 
     std::thread::spawn(move || {
-        if let Err(e) = run_bilateral_loop(&config, &telem, &stop_flag) {
+        let result = if config.method == BilateralMethod::OnDemand {
+            run_ondemand_loop(&config, &telem, &stop_flag)
+        } else {
+            run_bilateral_loop(&config, &telem, &stop_flag)
+        };
+        if let Err(e) = result {
             if let Ok(mut t) = telem.lock() {
                 t.last_error = Some(format!("Loop error: {}", e));
             }
@@ -540,6 +570,11 @@ fn run_bilateral_loop(
                 let tau_f = tau_diff + tau_ext_l;
 
                 (tau_l, tau_f)
+            }
+
+            BilateralMethod::OnDemand => {
+                // OnDemand is handled by run_ondemand_loop; this is unreachable.
+                unreachable!("OnDemand uses run_ondemand_loop")
             }
         };
 
@@ -686,6 +721,194 @@ fn run_bilateral_loop(
         cycle += 1;
 
         // Sleep to maintain target loop rate
+        let work_time = iter_start.elapsed();
+        if work_time < loop_period {
+            std::thread::sleep(loop_period - work_time);
+        }
+    }
+
+    // Disable both motors on exit
+    let _ = can_disable(&socket, host, lid);
+    let _ = can_disable(&socket, host, fid);
+
+    Ok(())
+}
+
+// =============================================================================
+// On-Demand Force Feedback
+// =============================================================================
+//
+// Leader motor stays DISABLED (completely free backdrive).
+// Position is read via parameter read (works when disabled).
+// Follower tracks leader position with PD control (MIT mode).
+// When follower detects reaction force (|torque| > threshold),
+// leader is ENABLED and receives reflected force.
+// When force drops below threshold*0.5 (hysteresis), leader is disabled again.
+
+fn run_ondemand_loop(
+    config: &BilateralConfig,
+    telemetry: &SharedTelemetry,
+    stop: &StopFlag,
+) -> Result<()> {
+    let socket = CanSocket::open(&config.interface)?;
+    socket.set_read_timeout(Duration::from_millis(10))?;
+
+    let scales = MitScales::for_model(config.model);
+    let host = config.host_id;
+    let lid = config.leader_id;
+    let fid = config.follower_id;
+
+    // Leader starts DISABLED (free to backdrive)
+    let _ = can_disable(&socket, host, lid);
+    std::thread::sleep(Duration::from_millis(20));
+
+    // Follower enabled in MIT mode
+    can_enable(&socket, host, fid)?;
+    std::thread::sleep(Duration::from_millis(20));
+
+    // Read initial leader position via param read
+    let l_pos_init = can_read_param(&socket, host, lid, ParamIndex::MechPos)? as f64;
+    let l_vel_init = can_read_param(&socket, host, lid, ParamIndex::MechVel)? as f64;
+
+    // Follower initial status (MIT zero)
+    let fb_f = mit_exchange(&socket, host, fid, &scales, 0.0, 0.0, 0.0, 0.0, 0.0)?;
+
+    let mut prev_l_pos = l_pos_init;
+    let mut prev_l_vel = l_vel_init;
+    let mut prev_f_pos = fb_f.position;
+    let mut prev_f_vel = fb_f.velocity;
+
+    let kp = config.gains.kp;
+    let kd = config.gains.kd;
+    let force_threshold = config.gains.force_threshold.abs().max(0.01);
+    let force_scale = config.gains.force_scale;
+    let coulomb = config.gains.coulomb_friction;
+    let viscous = config.gains.viscous_friction;
+    let loop_period = Duration::from_micros(config.loop_period_us);
+
+    let torque_limit = scales.torque * 0.5;
+
+    let mut leader_enabled = false;
+    let mut cycle: u64 = 0;
+    let mut loop_start = Instant::now();
+    let mut hz_accum = 0.0;
+    let mut hz_count = 0u32;
+    let start_time = Instant::now();
+
+    loop {
+        if stop.load(Ordering::Relaxed) {
+            break;
+        }
+
+        let iter_start = Instant::now();
+        let ramp = soft_start_gain(start_time.elapsed().as_secs_f64());
+        let _dt = if cycle == 0 {
+            loop_period.as_secs_f64()
+        } else {
+            iter_start.duration_since(loop_start).as_secs_f64().max(0.0001)
+        };
+        loop_start = iter_start;
+
+        // --- Read leader position (param read, works when disabled) ---
+        let l_pos = match can_read_param(&socket, host, lid, ParamIndex::MechPos) {
+            Ok(v) => v as f64,
+            Err(_) => prev_l_pos, // keep previous on timeout
+        };
+        let l_vel = match can_read_param(&socket, host, lid, ParamIndex::MechVel) {
+            Ok(v) => v as f64,
+            Err(_) => prev_l_vel,
+        };
+        prev_l_pos = l_pos;
+        prev_l_vel = l_vel;
+
+        // --- Follower: PD tracking of leader position ---
+        let pos_err = l_pos - prev_f_pos;
+        let vel_err = l_vel - prev_f_vel;
+        let tau_follower = (kp * pos_err + kd * vel_err) * ramp;
+
+        // Follower friction compensation
+        let friction_comp_f = friction_compensation(prev_f_vel, coulomb, viscous) * ramp;
+
+        let tau_follower_total = (tau_follower + friction_comp_f).clamp(-torque_limit, torque_limit);
+
+        // Send follower MIT command
+        let fb_f = match mit_exchange(
+            &socket, host, fid, &scales,
+            0.0, 0.0, 0.0, 0.0, tau_follower_total,
+        ) {
+            Ok(fb) => fb,
+            Err(_) => {
+                cycle += 1;
+                continue;
+            }
+        };
+
+        prev_f_pos = fb_f.position;
+        prev_f_vel = fb_f.velocity;
+
+        // --- Detect follower reaction force ---
+        // Use follower torque feedback as estimate of external force
+        let follower_force = fb_f.torque.abs();
+
+        // --- Leader enable/disable logic with hysteresis ---
+        let mut tau_leader_cmd: f64 = 0.0;
+        if !leader_enabled && follower_force > force_threshold {
+            // Contact detected -> enable leader for force feedback
+            can_enable(&socket, host, lid)?;
+            std::thread::sleep(Duration::from_millis(5));
+            leader_enabled = true;
+        }
+
+        if leader_enabled {
+            if follower_force < force_threshold * 0.5 {
+                // Contact released -> disable leader (free again)
+                let _ = can_disable(&socket, host, lid);
+                leader_enabled = false;
+            } else {
+                // Reflect follower torque back to leader
+                tau_leader_cmd = (-force_scale * fb_f.torque * ramp)
+                    .clamp(-torque_limit, torque_limit);
+                // Send MIT command to leader
+                let _ = mit_exchange(
+                    &socket, host, lid, &scales,
+                    0.0, 0.0, 0.0, 0.0, tau_leader_cmd,
+                );
+            }
+        }
+
+        // Compute loop frequency
+        let elapsed = iter_start.elapsed().as_secs_f64();
+        if elapsed > 0.0 {
+            hz_accum += 1.0 / elapsed;
+            hz_count += 1;
+        }
+
+        // Update telemetry
+        if cycle % 10 == 0 {
+            if let Ok(mut t) = telemetry.lock() {
+                t.leader_pos = l_pos;
+                t.leader_vel = l_vel;
+                t.leader_torque_cmd = tau_leader_cmd;
+                t.follower_pos = fb_f.position;
+                t.follower_vel = fb_f.velocity;
+                t.follower_torque_cmd = tau_follower_total;
+                t.position_error = l_pos - fb_f.position;
+                t.leader_friction_comp = 0.0;
+                t.follower_friction_comp = friction_comp_f;
+                t.leader_inertia_comp = if leader_enabled { 1.0 } else { 0.0 }; // reuse field as ON/OFF indicator
+                t.leader_vel_assist = follower_force; // reuse field to show detected force
+                t.cycle_count = cycle;
+                if hz_count > 0 {
+                    t.loop_hz = hz_accum / hz_count as f64;
+                    hz_accum = 0.0;
+                    hz_count = 0;
+                }
+                t.last_error = None;
+            }
+        }
+
+        cycle += 1;
+
         let work_time = iter_start.elapsed();
         if work_time < loop_period {
             std::thread::sleep(loop_period - work_time);
