@@ -775,13 +775,12 @@ fn run_ondemand_loop(
 
     let mut prev_l_pos = l_pos_init;
     let mut prev_l_vel = l_vel_init;
-    let mut prev_f_pos = fb_f.position;
+    let mut _prev_f_pos = fb_f.position;
     let mut prev_f_vel = fb_f.velocity;
 
     let kp = config.gains.kp;
     let kd = config.gains.kd;
     let force_threshold = config.gains.force_threshold.abs().max(0.01);
-    let force_scale = config.gains.force_scale;
     let coulomb = config.gains.coulomb_friction;
     let viscous = config.gains.viscous_friction;
     let loop_period = Duration::from_micros(config.loop_period_us);
@@ -821,20 +820,17 @@ fn run_ondemand_loop(
         prev_l_pos = l_pos;
         prev_l_vel = l_vel;
 
-        // --- Follower: PD tracking of leader position ---
-        let pos_err = l_pos - prev_f_pos;
-        let vel_err = l_vel - prev_f_vel;
-        let tau_follower = (kp * pos_err + kd * vel_err) * ramp;
-
-        // Follower friction compensation
+        // --- Follower: MIT internal position tracking of leader (10kHz) ---
+        // Motor internally computes: τ = kp*(pos_ref - pos) + kd*(vel_ref - vel) + τ_ff
+        // This runs at motor's internal rate (~10kHz), much stiffer than CAN-rate torque.
+        let mit_kp_f = kp * ramp;
+        let mit_kd_f = kd * ramp;
         let friction_comp_f = friction_compensation(prev_f_vel, coulomb, viscous) * ramp;
+        let tau_ff_f = friction_comp_f.clamp(-torque_limit, torque_limit);
 
-        let tau_follower_total = (tau_follower + friction_comp_f).clamp(-torque_limit, torque_limit);
-
-        // Send follower MIT command
         let fb_f = match mit_exchange(
             &socket, host, fid, &scales,
-            0.0, 0.0, 0.0, 0.0, tau_follower_total,
+            l_pos, l_vel, mit_kp_f, mit_kd_f, tau_ff_f,
         ) {
             Ok(fb) => fb,
             Err(_) => {
@@ -843,11 +839,17 @@ fn run_ondemand_loop(
             }
         };
 
-        prev_f_pos = fb_f.position;
+        // Estimate the total torque the follower is actually applying
+        // (used for force detection and telemetry)
+        let tau_follower_est = mit_kp_f * (l_pos - fb_f.position)
+            + mit_kd_f * (l_vel - fb_f.velocity)
+            + tau_ff_f;
+
+        _prev_f_pos = fb_f.position;
         prev_f_vel = fb_f.velocity;
 
         // --- Detect follower reaction force ---
-        // Use follower torque feedback as estimate of external force
+        // Position error indicates blocked motion; torque feedback confirms contact
         let follower_force = fb_f.torque.abs();
 
         // --- Leader enable/disable logic with hysteresis ---
@@ -865,14 +867,27 @@ fn run_ondemand_loop(
                 let _ = can_disable(&socket, host, lid);
                 leader_enabled = false;
             } else {
-                // Reflect follower torque back to leader
-                tau_leader_cmd = (-force_scale * fb_f.torque * ramp)
-                    .clamp(-torque_limit, torque_limit);
-                // Send MIT command to leader
-                let _ = mit_exchange(
+                // --- Leader: MIT internal position coupling to follower (10kHz) ---
+                // Motor internally computes: τ = kp*(follower_pos - leader_pos) + kd*(...)
+                // This gives rigid bidirectional coupling — leader is constrained
+                // to follower's actual position, which is blocked by the object.
+                let mit_kp_l = kp * ramp;
+                let mit_kd_l = kd * ramp;
+                let fb_l = match mit_exchange(
                     &socket, host, lid, &scales,
-                    0.0, 0.0, 0.0, 0.0, tau_leader_cmd,
-                );
+                    fb_f.position, fb_f.velocity, mit_kp_l, mit_kd_l, 0.0,
+                ) {
+                    Ok(fb) => fb,
+                    Err(_) => {
+                        cycle += 1;
+                        continue;
+                    }
+                };
+                tau_leader_cmd = mit_kp_l * (fb_f.position - fb_l.position)
+                    + mit_kd_l * (fb_f.velocity - fb_l.velocity);
+                // Update leader state from actual feedback
+                prev_l_pos = fb_l.position;
+                prev_l_vel = fb_l.velocity;
             }
         }
 
@@ -891,8 +906,8 @@ fn run_ondemand_loop(
                 t.leader_torque_cmd = tau_leader_cmd;
                 t.follower_pos = fb_f.position;
                 t.follower_vel = fb_f.velocity;
-                t.follower_torque_cmd = tau_follower_total;
-                t.position_error = l_pos - fb_f.position;
+                t.follower_torque_cmd = tau_follower_est;
+                t.position_error = prev_l_pos - fb_f.position;
                 t.leader_friction_comp = 0.0;
                 t.follower_friction_comp = friction_comp_f;
                 t.leader_inertia_comp = if leader_enabled { 1.0 } else { 0.0 }; // reuse field as ON/OFF indicator
