@@ -184,6 +184,8 @@ fn params_for_command(cmd: Command) -> Vec<ParamField> {
             ParamField::new("vel_ahead", "2.0", "Vel ref lookahead (1=off, 2-3 typ)"),
             ParamField::new("max_assist", "0.05", "Max assist torque [Nm] (safety limit)"),
             ParamField::new("f_thresh", "0.3", "Force threshold [Nm] (ondemand mode)"),
+            ParamField::with_choices("open_sign", "0", "Opening dir (ondemand: 0=off, +1/-1)",
+                "-1|0|+1"),
         ],
         Command::AssistTest => vec![
             ParamField::new("motor_id", "10", "Motor CAN ID to test"),
@@ -958,6 +960,11 @@ impl App {
         }
         if parts.len() > 13 {
             gains.force_threshold = parts[13].parse().unwrap_or(gains.force_threshold);
+        }
+        if parts.len() > 14 {
+            // Parse +1, -1, 0 (strip leading '+')
+            let s = parts[14].trim_start_matches('+');
+            gains.open_sign = s.parse().unwrap_or(gains.open_sign);
         }
 
         let config = BilateralConfig {
