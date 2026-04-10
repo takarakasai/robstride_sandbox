@@ -37,7 +37,7 @@ pub enum BilateralMethod {
     VirtualCoupling,
     /// 4: Mode-space (4ch) bilateral with observer-based force estimation.
     ModeSpace,
-    /// 5: Leader stays disabled (free); force feedback on follower contact.
+    /// 5: Leader stays disabled (free); force feedback on follower contact (legacy, use ondemand flag).
     OnDemand,
 }
 
@@ -387,6 +387,7 @@ pub struct BilateralConfig {
     pub follower_id: u8,
     pub model: MotorModel,
     pub method: BilateralMethod,
+    pub ondemand: bool,
     pub gains: BilateralGains,
     /// Target loop period [µs]
     pub loop_period_us: u64,
@@ -401,6 +402,7 @@ impl Default for BilateralConfig {
             follower_id: 1,
             model: MotorModel::Rs05,
             method: BilateralMethod::VirtualCoupling,
+            ondemand: false,
             gains: BilateralGains::default(),
             loop_period_us: 2000, // 500 Hz target
         }
@@ -534,55 +536,46 @@ fn run_bilateral_loop(
         // Compute torques based on method
         let (tau_leader, tau_follower) = match config.method {
             BilateralMethod::PositionMirroring => {
-                // Leader: free motion (low damping only)
-                let tau_l = -0.05 * prev_l_vel; // very light damping
-                // Follower: PD tracking of leader position
+                let tau_l = -0.05 * prev_l_vel;
                 let err = prev_l_pos - prev_f_pos;
                 let derr = prev_l_vel - prev_f_vel;
                 let tau_f = kp * err + kd * derr;
                 (tau_l, tau_f)
             }
-
             BilateralMethod::ForceReflecting => {
-                // Follower: PD tracking of leader position
                 let err = prev_l_pos - prev_f_pos;
                 let derr = prev_l_vel - prev_f_vel;
                 let tau_f = kp * err + kd * derr;
-                // Leader: reflected force from follower
-                let tau_l = -config.gains.force_scale * follower_torque_est
-                    - 0.05 * prev_l_vel;
+                let tau_l = -config.gains.force_scale * follower_torque_est - 0.05 * prev_l_vel;
                 (tau_l, tau_f)
             }
-
             BilateralMethod::VirtualCoupling => {
-                // Symmetric spring-damper
                 let err = prev_l_pos - prev_f_pos;
                 let derr = prev_l_vel - prev_f_vel;
                 let coupling = kp * err + kd * derr;
-                // Leader gets -coupling, follower gets +coupling
                 (-coupling, coupling)
             }
-
             BilateralMethod::ModeSpace => {
-                // 4-channel bilateral with DOB-based force estimation
                 let tau_ext_l = dob_leader.update(0.0, prev_l_vel, dt);
                 let tau_ext_f = dob_follower.update(0.0, prev_f_vel, dt);
-
                 let pos_err = prev_l_pos - prev_f_pos;
                 let vel_err = prev_l_vel - prev_f_vel;
                 let tau_diff = kp * pos_err + kd * vel_err;
-
                 let tau_l = -tau_diff + tau_ext_f;
                 let tau_f = tau_diff + tau_ext_l;
-
                 (tau_l, tau_f)
             }
-
             BilateralMethod::OnDemand => {
-                // OnDemand is handled by run_ondemand_loop; this is unreachable.
                 unreachable!("OnDemand uses run_ondemand_loop")
             }
         };
+        // OnDemand gating (all methods except OnDemand legacy)
+        let mut leader_enabled = true;
+        if config.ondemand && config.method != BilateralMethod::OnDemand {
+            let follower_force = follower_torque_est.abs();
+            let threshold = config.gains.force_threshold.abs().max(0.01);
+            leader_enabled = follower_force > threshold;
+        }
 
         // Friction compensation feedforward for each motor.
         // This cancels internal motor friction so it does not propagate
