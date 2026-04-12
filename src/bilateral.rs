@@ -19,7 +19,7 @@ use std::time::{Duration, Instant};
 
 use socketcan::{CanSocket, Socket};
 
-use crate::driver::{MotorDriver, RobstrideDriver};
+use crate::driver::MotorSpec;
 use crate::error::Result;
 use crate::protocol::MotorModel;
 
@@ -198,11 +198,8 @@ pub type StopFlag = Arc<AtomicBool>;
 // =============================================================================
 //
 // Concrete CAN protocol details live in [`crate::driver`]. The bilateral loops
-// only see a `Box<dyn MotorDriver>` per motor.
-
-fn make_driver(host_id: u8, motor_id: u8, model: MotorModel) -> Box<dyn MotorDriver> {
-    Box::new(RobstrideDriver::new(host_id, motor_id, model))
-}
+// only see a `Box<dyn MotorDriver>` per motor, built from the per-motor
+// [`MotorSpec`] in the config.
 
 // =============================================================================
 // First-order low-pass filter (for DOB)
@@ -281,13 +278,14 @@ impl DisturbanceObserver {
 // =============================================================================
 
 /// Configuration for launching the bilateral control loop.
+///
+/// Leader and follower are configured independently via [`MotorSpec`], so any
+/// combination of vendors / models can be used.
 #[derive(Debug, Clone)]
 pub struct BilateralConfig {
     pub interface: String,
-    pub host_id: u8,
-    pub leader_id: u8,
-    pub follower_id: u8,
-    pub model: MotorModel,
+    pub leader: MotorSpec,
+    pub follower: MotorSpec,
     pub method: BilateralMethod,
     pub ondemand: bool,
     pub gains: BilateralGains,
@@ -299,10 +297,8 @@ impl Default for BilateralConfig {
     fn default() -> Self {
         BilateralConfig {
             interface: "can0".to_string(),
-            host_id: 0xFD,
-            leader_id: 10,
-            follower_id: 1,
-            model: MotorModel::Rs05,
+            leader: MotorSpec::robstride(0xFD, 10, MotorModel::Rs05),
+            follower: MotorSpec::robstride(0xFD, 1, MotorModel::Rs05),
             method: BilateralMethod::VirtualCoupling,
             ondemand: false,
             gains: BilateralGains::default(),
@@ -374,8 +370,8 @@ fn run_bilateral_loop(
     let socket = CanSocket::open(&config.interface)?;
     socket.set_read_timeout(Duration::from_millis(10))?;
 
-    let leader = make_driver(config.host_id, config.leader_id, config.model);
-    let follower = make_driver(config.host_id, config.follower_id, config.model);
+    let leader = config.leader.build();
+    let follower = config.follower.build();
 
     // Enable both motors
     leader.enable(&socket)?;
@@ -653,8 +649,8 @@ fn run_ondemand_loop(
     let socket = CanSocket::open(&config.interface)?;
     socket.set_read_timeout(Duration::from_millis(10))?;
 
-    let leader = make_driver(config.host_id, config.leader_id, config.model);
-    let follower = make_driver(config.host_id, config.follower_id, config.model);
+    let leader = config.leader.build();
+    let follower = config.follower.build();
 
     // Leader starts DISABLED (free to backdrive)
     let _ = leader.disable(&socket);
@@ -846,9 +842,7 @@ fn run_ondemand_loop(
 #[derive(Debug, Clone)]
 pub struct AssistTestConfig {
     pub interface: String,
-    pub host_id: u8,
-    pub motor_id: u8,
-    pub model: MotorModel,
+    pub motor: MotorSpec,
     /// Motor-internal kd for velocity assist
     pub assist_kd: f64,
     /// Velocity reference lookahead factor
@@ -874,9 +868,7 @@ impl Default for AssistTestConfig {
     fn default() -> Self {
         AssistTestConfig {
             interface: "can0".to_string(),
-            host_id: 0xFD,
-            motor_id: 10,
-            model: MotorModel::Rs05,
+            motor: MotorSpec::robstride(0xFD, 10, MotorModel::Rs05),
             assist_kd: 0.0,
             vel_ahead: 2.0,
             coulomb_friction: 0.0,
@@ -925,7 +917,7 @@ fn run_assist_test_loop(
     let socket = CanSocket::open(&config.interface)?;
     socket.set_read_timeout(Duration::from_millis(10))?;
 
-    let motor = make_driver(config.host_id, config.motor_id, config.model);
+    let motor = config.motor.build();
 
     // Enable motor
     motor.enable(&socket)?;
