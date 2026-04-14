@@ -271,7 +271,8 @@ impl DamiaoModel {
 
     pub fn from_str_ci(s: &str) -> Option<Self> {
         match s.to_lowercase().as_str() {
-            "dm-j4310-2ec" | "dmj4310-2ec" | "dm-j4310" | "dmj4310" | "j4310-2ec" | "j4310" => {
+            "dm-j4310-2ec" | "dmj4310-2ec" | "dm-j4310" | "dmj4310"
+            | "j4310-2ec" | "j4310" | "dm4310" | "dm4310-2ec" => {
                 Some(DamiaoModel::DmJ4310_2EC)
             }
             _ => None,
