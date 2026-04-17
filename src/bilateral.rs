@@ -291,6 +291,12 @@ pub struct BilateralConfig {
     pub gains: BilateralGains,
     /// Target loop period [µs]
     pub loop_period_us: u64,
+    /// Safety position bound [rad]. If either motor's soft-zero-adjusted
+    /// position exceeds ±this value, the loop aborts and disables both
+    /// motors. Set <= 0 to disable. Default π (≈3.14) catches runaway from
+    /// assist-loop positive feedback / vendor sign mismatch / etc. before
+    /// the joint hits a hard mechanical stop.
+    pub safety_radius: f64,
 }
 
 impl Default for BilateralConfig {
@@ -303,6 +309,7 @@ impl Default for BilateralConfig {
             ondemand: false,
             gains: BilateralGains::default(),
             loop_period_us: 2000, // 500 Hz target
+            safety_radius: std::f64::consts::PI,
         }
     }
 }
@@ -571,6 +578,23 @@ fn run_bilateral_loop(
         prev_f_pos = fb_f.position;
         prev_f_vel = fb_f.velocity;
 
+        // Safety watchdog: bail out before either motor walks into a hard
+        // mechanical stop. Runaway typically comes from assist-loop positive
+        // feedback (low-friction DM leader) or a sign-convention mismatch
+        // between leader and follower.
+        if config.safety_radius > 0.0
+            && (fb_l.position.abs() > config.safety_radius
+                || fb_f.position.abs() > config.safety_radius)
+        {
+            if let Ok(mut t) = telemetry.lock() {
+                t.last_error = Some(format!(
+                    "SAFETY: |pos| exceeded {:.2} rad (leader={:.3}, follower={:.3}) — disabling",
+                    config.safety_radius, fb_l.position, fb_f.position,
+                ));
+            }
+            break;
+        }
+
         // Force-Reflecting: estimate follower external torque from iq_filt
         if config.method == BilateralMethod::ForceReflecting {
             // Use torque feedback directly as estimate
@@ -737,6 +761,20 @@ fn run_ondemand_loop(
 
         _prev_f_pos = fb_f.position;
         prev_f_vel = fb_f.velocity;
+
+        // Safety watchdog (see run_bilateral_loop for rationale).
+        if config.safety_radius > 0.0
+            && (l_pos.abs() > config.safety_radius
+                || fb_f.position.abs() > config.safety_radius)
+        {
+            if let Ok(mut t) = telemetry.lock() {
+                t.last_error = Some(format!(
+                    "SAFETY: |pos| exceeded {:.2} rad (leader={:.3}, follower={:.3}) — disabling",
+                    config.safety_radius, l_pos, fb_f.position,
+                ));
+            }
+            break;
+        }
 
         // --- Detect follower reaction force ---
         // Position error indicates blocked motion; torque feedback confirms contact

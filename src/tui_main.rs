@@ -219,12 +219,13 @@ fn params_for_command(cmd: Command) -> Vec<ParamField> {
             ParamField::new("dob_cut", "100.0", "DOB cutoff [rad/s] (mode method)"),
             ParamField::new("iner_comp", "0.0", "Leader inertia FF comp [0-1]"),
             ParamField::new("acc_cut", "50.0", "Accel LPF cutoff [rad/s]"),
-            ParamField::new("assist_kd", "0.3", "Leader motor-internal kd assist"),
+            ParamField::new("assist_kd", "0.0", "Leader motor-internal kd assist (0=off; CAUTION: low-friction motors)"),
             ParamField::new("vel_ahead", "2.0", "Vel ref lookahead (1=off, 2-3 typ)"),
             ParamField::new("max_assist", "0.05", "Max assist torque [Nm] (safety limit)"),
             ParamField::new("f_thresh", "0.3", "Force threshold [Nm] (ondemand mode)"),
             ParamField::with_choices("open_sign", "0", "Opening dir (ondemand: 0=off, +1/-1)",
                 "-1|0|+1"),
+            ParamField::new("safety_rad", "3.14", "Disable both motors if |pos|>this [rad] (0=off)"),
         ],
         Command::ZeroPair => vec![
             ParamField::with_choices("lead_kind", "rs05", "Leader motor kind",
@@ -1102,6 +1103,9 @@ impl App {
             let trimmed = s.trim_start_matches('+');
             gains.open_sign = trimmed.parse().unwrap_or(gains.open_sign);
         }
+        let safety_radius: f64 = get(19)
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(std::f64::consts::PI);
 
         let config = BilateralConfig {
             interface: self.interface.clone(),
@@ -1111,15 +1115,17 @@ impl App {
             ondemand: false,
             gains,
             loop_period_us: 2000,
+            safety_radius,
         };
 
         self.log_msg(format!(
-            "Starting bilateral control: {} (Kp={:.2}, Kd={:.2}, Cf={:.3}, Vf={:.3})",
+            "Starting bilateral control: {} (Kp={:.2}, Kd={:.2}, Cf={:.3}, Vf={:.3}, safety_rad={:.2})",
             method.label(),
             gains.kp,
             gains.kd,
             gains.coulomb_friction,
             gains.viscous_friction,
+            safety_radius,
         ));
         self.log_msg(format!(
             "  Leader={}, Follower={}  Press Esc to stop.",
