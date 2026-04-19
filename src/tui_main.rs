@@ -616,7 +616,14 @@ impl App {
         } else {
             self.log_msg(format!("Found {} motor(s).", results.len()));
             for (id, data) in results {
-                let exists = self.motors.iter().any(|m| m.id() == id);
+                // Vendor-specific dedup: a DAMIAO at the same numeric ID
+                // must not block adding the Robstride at that ID, and vice
+                // versa. Robstride uses 29-bit extended IDs and DAMIAO uses
+                // 11-bit standard IDs so the two share number space without
+                // colliding on the wire.
+                let exists = self.motors.iter().any(|m| {
+                    matches!(m.spec, MotorSpec::Robstride { .. }) && m.id() == id
+                });
                 if !exists {
                     let entry = MotorEntry {
                         spec: MotorSpec::robstride(self.host_id, id, self.default_model),
