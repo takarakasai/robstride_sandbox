@@ -170,12 +170,12 @@ fn params_for_command(cmd: Command) -> Vec<ParamField> {
         ],
         Command::Bilateral => vec![
             ParamField::with_choices("method", "coupling", "Control method",
-                "pos|force|coupling|mode"),
+                "pos|force|coupling|mode|ondemand"),
             ParamField::new("kp", "5.0", "Spring stiffness [Nm/rad]"),
             ParamField::new("kd", "0.3", "Damping [Nm·s/rad]"),
             ParamField::new("coulomb", "0.05", "Coulomb friction comp [Nm]"),
             ParamField::new("viscous", "0.01", "Viscous friction comp [Nm·s/rad]"),
-            ParamField::new("force_sc", "0.5", "Force refl scale (force method)"),
+            ParamField::new("force_sc", "0.5", "Force refl scale (force/ondemand)"),
             ParamField::new("inertia", "0.005", "Motor inertia [kg·m²]"),
             ParamField::new("dob_cut", "100.0", "DOB cutoff [rad/s] (mode method)"),
             ParamField::new("iner_comp", "0.0", "Leader inertia FF comp [0-1]"),
@@ -183,6 +183,7 @@ fn params_for_command(cmd: Command) -> Vec<ParamField> {
             ParamField::new("assist_kd", "0.3", "Leader motor-internal kd assist"),
             ParamField::new("vel_ahead", "2.0", "Vel ref lookahead (1=off, 2-3 typ)"),
             ParamField::new("max_assist", "0.05", "Max assist torque [Nm] (safety limit)"),
+            ParamField::new("f_thresh", "0.3", "Force threshold [Nm] (ondemand mode)"),
         ],
         Command::AssistTest => vec![
             ParamField::new("motor_id", "10", "Motor CAN ID to test"),
@@ -911,7 +912,7 @@ impl App {
             Some(m) => m,
             None => {
                 self.log_msg(format!(
-                    "Unknown method '{}'. Use: pos, force, coupling, mode",
+                    "Unknown method '{}'. Use: pos, force, coupling, mode, ondemand",
                     method_str
                 ));
                 return;
@@ -954,6 +955,9 @@ impl App {
         }
         if parts.len() > 12 {
             gains.max_assist = parts[12].parse().unwrap_or(gains.max_assist);
+        }
+        if parts.len() > 13 {
+            gains.force_threshold = parts[13].parse().unwrap_or(gains.force_threshold);
         }
 
         let config = BilateralConfig {
@@ -1716,6 +1720,7 @@ fn render_bilateral_overlay(frame: &mut Frame, app: &App) {
     };
 
     let is_assist_test = telem.method.is_none();
+    let is_ondemand = telem.method == Some(BilateralMethod::OnDemand);
     let method_name = telem
         .method
         .map(|m| m.label())
@@ -1735,19 +1740,27 @@ fn render_bilateral_overlay(frame: &mut Frame, app: &App) {
             Span::raw("    "),
             Span::styled(format!("Cycles: {}", telem.cycle_count), Style::default().fg(Color::DarkGray)),
         ]),
-        Line::from(vec![
-            Span::styled(
-                if is_assist_test { " Motor:       " } else { " Leader  (10): " },
-                Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
-            ),
-            Span::raw(format!(
-                "pos={:>8.3}  vel={:>8.3}  τcmd={:>7.3}",
-                telem.leader_pos, telem.leader_vel, telem.leader_torque_cmd,
-            )),
-        ]),
     ];
 
-    if !is_assist_test {
+    if is_ondemand {
+        // OnDemand specific: leader ON/OFF status and detected force
+        let leader_on = telem.leader_inertia_comp > 0.5;
+        let detected_force = telem.leader_vel_assist; // reused field
+        text.push(Line::from(vec![
+            Span::styled(" Leader  (10): ", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+            Span::raw(format!(
+                "pos={:>8.3}  vel={:>8.3}  τcmd={:>7.3}  ",
+                telem.leader_pos, telem.leader_vel, telem.leader_torque_cmd,
+            )),
+            Span::styled(
+                if leader_on { "● ON " } else { "○ OFF" },
+                if leader_on {
+                    Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(Color::DarkGray)
+                },
+            ),
+        ]));
         text.push(Line::from(vec![
             Span::styled(" Follow  ( 1): ", Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD)),
             Span::raw(format!(
@@ -1766,30 +1779,76 @@ fn render_bilateral_overlay(frame: &mut Frame, app: &App) {
                 },
             ),
             Span::raw("   "),
+            Span::styled("Force: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                format!("{:>6.3} Nm", detected_force),
+                if leader_on {
+                    Style::default().fg(Color::Yellow)
+                } else {
+                    Style::default().fg(Color::White)
+                },
+            ),
+            Span::raw("  "),
             Span::styled("FrComp: ", Style::default().fg(Color::DarkGray)),
-            Span::raw(format!(
-                "L={:>6.3} F={:>6.3}",
-                telem.leader_friction_comp, telem.follower_friction_comp,
-            )),
-            Span::raw("  "),
-            Span::styled("InrComp: ", Style::default().fg(Color::DarkGray)),
-            Span::raw(format!("{:>6.3}", telem.leader_inertia_comp)),
-            Span::raw("  "),
-            Span::styled("VelAst: ", Style::default().fg(Color::DarkGray)),
-            Span::raw(format!("{:>6.3}", telem.leader_vel_assist)),
+            Span::raw(format!("{:>6.3}", telem.follower_friction_comp)),
         ]));
     } else {
+        // Regular bilateral or assist-test display
         text.push(Line::from(vec![
-            Span::styled(" FrComp: ", Style::default().fg(Color::DarkGray)),
-            Span::raw(format!("{:>6.3}", telem.leader_friction_comp)),
-            Span::raw("  "),
-            Span::styled("InrComp: ", Style::default().fg(Color::DarkGray)),
-            Span::raw(format!("{:>6.3}", telem.leader_inertia_comp)),
-            Span::raw("  "),
-            Span::styled("VelAst: ", Style::default().fg(Color::DarkGray)),
-            Span::raw(format!("{:>6.3}", telem.leader_vel_assist)),
+            Span::styled(
+                if is_assist_test { " Motor:       " } else { " Leader  (10): " },
+                Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(format!(
+                "pos={:>8.3}  vel={:>8.3}  τcmd={:>7.3}",
+                telem.leader_pos, telem.leader_vel, telem.leader_torque_cmd,
+            )),
         ]));
-    }
+
+        if !is_assist_test {
+            text.push(Line::from(vec![
+                Span::styled(" Follow  ( 1): ", Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD)),
+                Span::raw(format!(
+                    "pos={:>8.3}  vel={:>8.3}  τcmd={:>7.3}",
+                    telem.follower_pos, telem.follower_vel, telem.follower_torque_cmd,
+                )),
+            ]));
+            text.push(Line::from(vec![
+                Span::styled(" Δpos: ", Style::default().fg(Color::Yellow)),
+                Span::styled(
+                    format!("{:>8.4} rad", telem.position_error),
+                    if telem.position_error.abs() > 0.5 {
+                        Style::default().fg(Color::Red)
+                    } else {
+                        Style::default().fg(Color::White)
+                    },
+                ),
+                Span::raw("   "),
+                Span::styled("FrComp: ", Style::default().fg(Color::DarkGray)),
+                Span::raw(format!(
+                    "L={:>6.3} F={:>6.3}",
+                    telem.leader_friction_comp, telem.follower_friction_comp,
+                )),
+                Span::raw("  "),
+                Span::styled("InrComp: ", Style::default().fg(Color::DarkGray)),
+                Span::raw(format!("{:>6.3}", telem.leader_inertia_comp)),
+                Span::raw("  "),
+                Span::styled("VelAst: ", Style::default().fg(Color::DarkGray)),
+                Span::raw(format!("{:>6.3}", telem.leader_vel_assist)),
+            ]));
+        } else {
+            text.push(Line::from(vec![
+                Span::styled(" FrComp: ", Style::default().fg(Color::DarkGray)),
+                Span::raw(format!("{:>6.3}", telem.leader_friction_comp)),
+                Span::raw("  "),
+                Span::styled("InrComp: ", Style::default().fg(Color::DarkGray)),
+                Span::raw(format!("{:>6.3}", telem.leader_inertia_comp)),
+                Span::raw("  "),
+                Span::styled("VelAst: ", Style::default().fg(Color::DarkGray)),
+                Span::raw(format!("{:>6.3}", telem.leader_vel_assist)),
+            ]));
+        }
+    } // end else (not ondemand)
 
     text.push(Line::from(vec![
         Span::raw(" "),
