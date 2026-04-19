@@ -614,7 +614,7 @@ impl Motor {
 
 /// Helper to reconstruct a raw CAN ID from parsed components.
 fn build_can_id_raw(comm_type: u8, extra_data: u16, device_id: u8) -> u32 {
-    ((comm_type as u32) << 24) | ((extra_data as u32) << 8) | (device_id as u32)
+    crate::protocol::build_can_id_raw(comm_type, extra_data, device_id)
 }
 
 impl Drop for Motor {
