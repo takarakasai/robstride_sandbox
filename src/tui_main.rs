@@ -124,7 +124,7 @@ impl Command {
             Command::Spin => "velocity_rad_s (e.g. 1.5)",
             Command::Torque => "torque_nm (e.g. 0.5)",
             Command::MitControl => "pos vel kp kd torque (e.g. 0 0 10 0.5 0)",
-            Command::Bilateral => "method [kp kd] (e.g. coupling 5.0 0.3)",
+            Command::Bilateral => "method [kp kd [cf vf]] (e.g. coupling 5.0 0.3 0.05 0.01)",
             _ => "",
         }
     }
@@ -705,7 +705,7 @@ impl App {
             return;
         }
 
-        // Parse: method [kp kd [force_scale] [inertia dob_cutoff]]
+        // Parse: method [kp kd [coulomb_friction viscous_friction] [force_scale] [inertia dob_cutoff]]
         let parts: Vec<&str> = input.trim().split_whitespace().collect();
         let method_str = if !parts.is_empty() { parts[0] } else { "coupling" };
         let method = match BilateralMethod::from_short(method_str) {
@@ -727,13 +727,19 @@ impl App {
             gains.kd = parts[2].parse().unwrap_or(gains.kd);
         }
         if parts.len() > 3 {
-            gains.force_scale = parts[3].parse().unwrap_or(gains.force_scale);
+            gains.coulomb_friction = parts[3].parse().unwrap_or(gains.coulomb_friction);
         }
         if parts.len() > 4 {
-            gains.inertia = parts[4].parse().unwrap_or(gains.inertia);
+            gains.viscous_friction = parts[4].parse().unwrap_or(gains.viscous_friction);
         }
         if parts.len() > 5 {
-            gains.dob_cutoff = parts[5].parse().unwrap_or(gains.dob_cutoff);
+            gains.force_scale = parts[5].parse().unwrap_or(gains.force_scale);
+        }
+        if parts.len() > 6 {
+            gains.inertia = parts[6].parse().unwrap_or(gains.inertia);
+        }
+        if parts.len() > 7 {
+            gains.dob_cutoff = parts[7].parse().unwrap_or(gains.dob_cutoff);
         }
 
         let config = BilateralConfig {
@@ -748,10 +754,12 @@ impl App {
         };
 
         self.log_msg(format!(
-            "Starting bilateral control: {} (Kp={:.2}, Kd={:.2})",
+            "Starting bilateral control: {} (Kp={:.2}, Kd={:.2}, Cf={:.3}, Vf={:.3})",
             method.label(),
             gains.kp,
             gains.kd,
+            gains.coulomb_friction,
+            gains.viscous_friction,
         ));
         self.log_msg(format!(
             "  Leader=ID:{}, Follower=ID:{}  Press Esc to stop.",
@@ -1255,7 +1263,15 @@ fn render_bilateral_overlay(frame: &mut Frame, app: &App) {
                     Style::default().fg(Color::White)
                 },
             ),
-            Span::raw("    "),
+            Span::raw("   "),
+            Span::styled("FrComp: ", Style::default().fg(Color::DarkGray)),
+            Span::raw(format!(
+                "L={:>6.3} F={:>6.3}",
+                telem.leader_friction_comp, telem.follower_friction_comp,
+            )),
+        ]),
+        Line::from(vec![
+            Span::raw(" "),
             Span::styled(
                 match &telem.last_error {
                     Some(e) => format!("ERR: {}", e),

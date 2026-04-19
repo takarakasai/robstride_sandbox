@@ -89,6 +89,10 @@ pub struct BilateralGains {
     pub inertia: f64,
     /// DOB cutoff frequency [rad/s] (for Mode-Space)
     pub dob_cutoff: f64,
+    /// Coulomb friction estimate [Nm] (constant friction opposing motion)
+    pub coulomb_friction: f64,
+    /// Viscous friction coefficient [Nm·s/rad] (friction proportional to velocity)
+    pub viscous_friction: f64,
 }
 
 impl Default for BilateralGains {
@@ -99,6 +103,8 @@ impl Default for BilateralGains {
             force_scale: 0.5,
             inertia: 0.005,
             dob_cutoff: 100.0,
+            coulomb_friction: 0.05,
+            viscous_friction: 0.01,
         }
     }
 }
@@ -122,6 +128,10 @@ pub struct BilateralTelemetry {
     pub loop_hz: f64,
     /// Position error θ_leader - θ_follower [rad]
     pub position_error: f64,
+    /// Leader friction compensation torque [Nm]
+    pub leader_friction_comp: f64,
+    /// Follower friction compensation torque [Nm]
+    pub follower_friction_comp: f64,
     /// Number of control cycles executed
     pub cycle_count: u64,
     /// Active method
@@ -338,6 +348,21 @@ impl Default for BilateralConfig {
     }
 }
 
+/// Compute friction compensation feedforward torque.
+///
+/// Returns a torque in the direction of motion to overcome internal friction:
+///   τ_comp = coulomb·sign(ω) + viscous·ω
+///
+/// A small dead zone (|ω| < 0.01) avoids sign chatter at zero velocity.
+fn friction_compensation(velocity: f64, coulomb: f64, viscous: f64) -> f64 {
+    let sign = if velocity.abs() < 0.01 {
+        0.0
+    } else {
+        velocity.signum()
+    };
+    coulomb * sign + viscous * velocity
+}
+
 /// Launch the bilateral control loop in a background thread.
 ///
 /// Returns (telemetry_handle, stop_flag) that let the caller monitor and stop the loop.
@@ -402,6 +427,8 @@ fn run_bilateral_loop(
 
     let kp = config.gains.kp;
     let kd = config.gains.kd;
+    let coulomb = config.gains.coulomb_friction;
+    let viscous = config.gains.viscous_friction;
     let loop_period = Duration::from_micros(config.loop_period_us);
     let mut cycle: u64 = 0;
     let mut loop_start = Instant::now();
@@ -458,25 +485,13 @@ fn run_bilateral_loop(
 
             BilateralMethod::ModeSpace => {
                 // 4-channel bilateral with DOB-based force estimation
-                //
-                // Differential mode: θ_L - θ_F → 0  (position tracking)
-                // Common mode:  τ_ext_L + τ_ext_F → 0  (force transparency)
-                //
-                // τ_ext estimated by DOB: τ_ext = τ_cmd - J·α (filtered)
-
                 let tau_ext_l = dob_leader.update(0.0, prev_l_vel, dt);
                 let tau_ext_f = dob_follower.update(0.0, prev_f_vel, dt);
 
-                // Position error (differential)
                 let pos_err = prev_l_pos - prev_f_pos;
                 let vel_err = prev_l_vel - prev_f_vel;
-
-                // Differential mode controller
                 let tau_diff = kp * pos_err + kd * vel_err;
 
-                // Common mode controller → force transparency
-                // τ_L + τ_F ≈ τ_ext_L + τ_ext_F should → 0
-                // We add force compensation: each motor also reflects the other's force
                 let tau_l = -tau_diff + tau_ext_f;
                 let tau_f = tau_diff + tau_ext_l;
 
@@ -484,9 +499,20 @@ fn run_bilateral_loop(
             }
         };
 
+        // Friction compensation feedforward for each motor.
+        // This cancels internal motor friction so it does not propagate
+        // through the virtual coupling as a phantom force.
+        //   τ_comp = coulomb·sign(ω) + viscous·ω
+        // Applied in the direction of existing velocity to overcome friction.
+        let friction_comp_l = friction_compensation(prev_l_vel, coulomb, viscous);
+        let friction_comp_f = friction_compensation(prev_f_vel, coulomb, viscous);
+
+        let tau_leader_total = tau_leader + friction_comp_l;
+        let tau_follower_total = tau_follower + friction_comp_f;
+
         // Clamp
-        let tau_leader_clamped = tau_leader.clamp(-torque_limit, torque_limit);
-        let tau_follower_clamped = tau_follower.clamp(-torque_limit, torque_limit);
+        let tau_leader_clamped = tau_leader_total.clamp(-torque_limit, torque_limit);
+        let tau_follower_clamped = tau_follower_total.clamp(-torque_limit, torque_limit);
 
         // Send MIT commands (kp=0, kd=0, torque feedforward only)
         let fb_l = match mit_exchange(
@@ -546,6 +572,8 @@ fn run_bilateral_loop(
                 t.follower_vel = fb_f.velocity;
                 t.follower_torque_cmd = tau_follower_clamped;
                 t.position_error = fb_l.position - fb_f.position;
+                t.leader_friction_comp = friction_comp_l;
+                t.follower_friction_comp = friction_comp_f;
                 t.cycle_count = cycle;
                 if hz_count > 0 {
                     t.loop_hz = hz_accum / hz_count as f64;
