@@ -40,7 +40,95 @@ struct MotorEntry {
 enum Focus {
     Motors,
     Commands,
+    Params,
+    #[allow(dead_code)]
     Input,
+}
+
+/// A parameter field shown in the Params panel.
+#[derive(Debug, Clone)]
+struct ParamField {
+    /// Display name
+    name: &'static str,
+    /// Current value as string
+    value: String,
+    /// Description / hint
+    desc: &'static str,
+    /// Is this an enum-like choice? (list options separated by |)
+    choices: Option<&'static str>,
+}
+
+impl ParamField {
+    fn new(name: &'static str, value: &str, desc: &'static str) -> Self {
+        ParamField {
+            name,
+            value: value.to_string(),
+            desc,
+            choices: None,
+        }
+    }
+
+    fn with_choices(name: &'static str, value: &str, desc: &'static str, choices: &'static str) -> Self {
+        ParamField {
+            name,
+            value: value.to_string(),
+            desc,
+            choices: Some(choices),
+        }
+    }
+}
+
+/// Get parameter fields for the selected command.
+fn params_for_command(cmd: Command) -> Vec<ParamField> {
+    match cmd {
+        Command::Scan => vec![
+            ParamField::new("from", "1", "Start ID [1-254]"),
+            ParamField::new("to", "127", "End ID [1-254]"),
+        ],
+        Command::ReadParam => vec![
+            ParamField::with_choices("param", "mech_pos", "Parameter name",
+                "mech_pos|mech_vel|iq_filt|vbus|limit_torque|limit_spd|limit_cur|run_mode|loc_kp|spd_kp|spd_ki"),
+        ],
+        Command::WriteParam => vec![
+            ParamField::with_choices("param", "limit_spd", "Parameter name",
+                "limit_torque|limit_spd|limit_cur|loc_kp|spd_kp|spd_ki"),
+            ParamField::new("value", "10.0", "Float value to write"),
+        ],
+        Command::SetRunMode => vec![
+            ParamField::with_choices("mode", "mit", "Motor run mode",
+                "mit|position|velocity|torque"),
+        ],
+        Command::MoveTo => vec![
+            ParamField::new("position", "0.0", "Target position [rad]"),
+            ParamField::new("speed", "5.0", "Speed limit [rad/s]"),
+        ],
+        Command::Spin => vec![
+            ParamField::new("velocity", "1.0", "Target velocity [rad/s]"),
+        ],
+        Command::Torque => vec![
+            ParamField::new("torque", "0.0", "Target torque [Nm]"),
+        ],
+        Command::MitControl => vec![
+            ParamField::new("pos", "0.0", "Position ref [rad]"),
+            ParamField::new("vel", "0.0", "Velocity ref [rad/s]"),
+            ParamField::new("kp", "10.0", "Proportional gain"),
+            ParamField::new("kd", "0.5", "Derivative gain"),
+            ParamField::new("torque", "0.0", "Torque FF [Nm]"),
+        ],
+        Command::Bilateral => vec![
+            ParamField::with_choices("method", "coupling", "Control method",
+                "pos|force|coupling|mode"),
+            ParamField::new("kp", "5.0", "Spring stiffness [Nm/rad]"),
+            ParamField::new("kd", "0.3", "Damping [Nm·s/rad]"),
+            ParamField::new("coulomb", "0.05", "Coulomb friction comp [Nm]"),
+            ParamField::new("viscous", "0.01", "Viscous friction comp [Nm·s/rad]"),
+            ParamField::new("force_sc", "0.5", "Force reflection scale (force method)"),
+            ParamField::new("inertia", "0.005", "Motor inertia [kg·m²] (mode method)"),
+            ParamField::new("dob_cut", "100.0", "DOB cutoff [rad/s] (mode method)"),
+        ],
+        // Commands with no parameters
+        _ => vec![],
+    }
 }
 
 /// Available commands.
@@ -99,34 +187,8 @@ impl Command {
         }
     }
 
-    fn needs_input(&self) -> bool {
-        matches!(
-            self,
-            Command::Scan
-                | Command::ReadParam
-                | Command::WriteParam
-                | Command::SetRunMode
-                | Command::MoveTo
-                | Command::Spin
-                | Command::Torque
-                | Command::MitControl
-                | Command::Bilateral
-        )
-    }
-
-    fn input_hint(&self) -> &'static str {
-        match self {
-            Command::Scan => "[from] [to] (default: 1 127, e.g. 1 20)",
-            Command::ReadParam => "param name (mech_pos, mech_vel, vbus, ...)",
-            Command::WriteParam => "name value (e.g. limit_spd 10.0)",
-            Command::SetRunMode => "mode (mit, position, velocity, torque)",
-            Command::MoveTo => "position_rad [speed_limit] (e.g. 3.14 5.0)",
-            Command::Spin => "velocity_rad_s (e.g. 1.5)",
-            Command::Torque => "torque_nm (e.g. 0.5)",
-            Command::MitControl => "pos vel kp kd torque (e.g. 0 0 10 0.5 0)",
-            Command::Bilateral => "method [kp kd [cf vf]] (e.g. coupling 5.0 0.3 0.05 0.01)",
-            _ => "",
-        }
+    fn has_params(&self) -> bool {
+        !params_for_command(*self).is_empty()
     }
 }
 
@@ -171,6 +233,14 @@ struct App {
     bilateral_telemetry: Option<SharedTelemetry>,
     /// Bilateral control stop flag (if running)
     bilateral_stop: Option<StopFlag>,
+    /// Parameter fields for the currently selected command
+    params: Vec<ParamField>,
+    /// Selected param index in the Params panel
+    selected_param: usize,
+    /// Whether we're editing a param value inline
+    editing_param: bool,
+    /// Edit buffer for inline param editing
+    param_edit_buf: String,
 }
 
 impl App {
@@ -196,6 +266,10 @@ impl App {
             scan_results: Arc::new(Mutex::new(Vec::new())),
             bilateral_telemetry: None,
             bilateral_stop: None,
+            params: params_for_command(Command::ALL[0]),
+            selected_param: 0,
+            editing_param: false,
+            param_edit_buf: String::new(),
         }
     }
 
@@ -844,13 +918,36 @@ impl App {
     // Input handling
     // =========================================================================
 
+    /// Build a space-separated input string from the current params.
+    fn params_as_input(&self) -> String {
+        self.params.iter().map(|p| p.value.as_str()).collect::<Vec<_>>().join(" ")
+    }
+
+    /// Sync params to the currently selected command (preserving values if names match).
+    fn sync_params_to_cmd(&mut self) {
+        let cmd = Command::ALL[self.selected_cmd];
+        let new = params_for_command(cmd);
+        // Try to preserve values from old params if same name
+        let merged: Vec<ParamField> = new
+            .into_iter()
+            .map(|mut nf| {
+                if let Some(old) = self.params.iter().find(|o| o.name == nf.name) {
+                    nf.value = old.value.clone();
+                }
+                nf
+            })
+            .collect();
+        self.params = merged;
+        self.selected_param = 0;
+    }
+
     fn handle_key(&mut self, key: KeyEvent) {
         // Global keys
         if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
             self.quit = true;
             return;
         }
-        if key.code == KeyCode::Char('q') && !self.input_mode {
+        if key.code == KeyCode::Char('q') && !self.editing_param && !self.input_mode {
             if self.bilateral_active() {
                 self.stop_bilateral();
                 return;
@@ -859,13 +956,49 @@ impl App {
             return;
         }
 
-        // Esc stops bilateral control if running (outside input mode)
-        if key.code == KeyCode::Esc && !self.input_mode && self.bilateral_active() {
+        // Esc stops bilateral control if running (outside editing)
+        if key.code == KeyCode::Esc && !self.editing_param && !self.input_mode && self.bilateral_active() {
             self.stop_bilateral();
             return;
         }
 
-        // Input mode handling
+        // Inline param editing mode
+        if self.editing_param {
+            match key.code {
+                KeyCode::Enter => {
+                    // Apply edited value
+                    if self.selected_param < self.params.len() {
+                        self.params[self.selected_param].value = self.param_edit_buf.clone();
+                    }
+                    self.editing_param = false;
+                    self.param_edit_buf.clear();
+                }
+                KeyCode::Esc => {
+                    self.editing_param = false;
+                    self.param_edit_buf.clear();
+                }
+                KeyCode::Char(c) => {
+                    self.param_edit_buf.push(c);
+                }
+                KeyCode::Backspace => {
+                    self.param_edit_buf.pop();
+                }
+                KeyCode::Tab => {
+                    // Tab cycles through choices if available
+                    if let Some(choices) = self.params.get(self.selected_param).and_then(|p| p.choices) {
+                        let opts: Vec<&str> = choices.split('|').collect();
+                        let cur = self.param_edit_buf.trim();
+                        let idx = opts.iter().position(|o| *o == cur).unwrap_or(0);
+                        let next = opts[(idx + 1) % opts.len()];
+                        self.param_edit_buf = next.to_string();
+                    }
+                }
+                _ => {}
+            }
+            return;
+        }
+
+        // Legacy input mode (still used for scan range etc. if needed)
         if self.input_mode {
             match key.code {
                 KeyCode::Enter => {
@@ -896,9 +1029,34 @@ impl App {
 
         // Panel switching
         if key.code == KeyCode::Tab {
+            let cmd = Command::ALL[self.selected_cmd];
             self.focus = match self.focus {
                 Focus::Motors => Focus::Commands,
+                Focus::Commands => {
+                    if cmd.has_params() {
+                        Focus::Params
+                    } else {
+                        Focus::Motors
+                    }
+                }
+                Focus::Params => Focus::Motors,
+                Focus::Input => Focus::Commands,
+            };
+            return;
+        }
+        // Shift+Tab = reverse
+        if key.code == KeyCode::BackTab {
+            let cmd = Command::ALL[self.selected_cmd];
+            self.focus = match self.focus {
+                Focus::Motors => {
+                    if cmd.has_params() {
+                        Focus::Params
+                    } else {
+                        Focus::Commands
+                    }
+                }
                 Focus::Commands => Focus::Motors,
+                Focus::Params => Focus::Commands,
                 Focus::Input => Focus::Commands,
             };
             return;
@@ -926,23 +1084,54 @@ impl App {
                 KeyCode::Up | KeyCode::Char('k') => {
                     if self.selected_cmd > 0 {
                         self.selected_cmd -= 1;
+                        self.sync_params_to_cmd();
                     }
                 }
                 KeyCode::Down | KeyCode::Char('j') => {
                     if self.selected_cmd + 1 < Command::ALL.len() {
                         self.selected_cmd += 1;
+                        self.sync_params_to_cmd();
                     }
                 }
                 KeyCode::Enter => {
                     let cmd = Command::ALL[self.selected_cmd];
-                    if cmd.needs_input() {
-                        self.input_mode = true;
-                        self.pending_cmd = Some(cmd);
-                        self.input_buf.clear();
-                        self.focus = Focus::Input;
-                    } else {
-                        self.execute_command(cmd, "");
+                    let input = self.params_as_input();
+                    self.execute_command(cmd, &input);
+                }
+                KeyCode::Right | KeyCode::Char('l') => {
+                    let cmd = Command::ALL[self.selected_cmd];
+                    if cmd.has_params() {
+                        self.focus = Focus::Params;
                     }
+                }
+                _ => {}
+            },
+            Focus::Params => match key.code {
+                KeyCode::Up | KeyCode::Char('k') => {
+                    if self.selected_param > 0 {
+                        self.selected_param -= 1;
+                    }
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    if self.selected_param + 1 < self.params.len() {
+                        self.selected_param += 1;
+                    }
+                }
+                KeyCode::Enter => {
+                    // Start editing the selected param
+                    if self.selected_param < self.params.len() {
+                        self.editing_param = true;
+                        self.param_edit_buf = self.params[self.selected_param].value.clone();
+                    }
+                }
+                KeyCode::Left | KeyCode::Char('h') => {
+                    self.focus = Focus::Commands;
+                }
+                // Quick execute with current params
+                KeyCode::Char('x') => {
+                    let cmd = Command::ALL[self.selected_cmd];
+                    let input = self.params_as_input();
+                    self.execute_command(cmd, &input);
                 }
                 _ => {}
             },
@@ -956,17 +1145,33 @@ impl App {
 // =============================================================================
 
 fn ui(frame: &mut Frame, app: &App) {
-    // Overall layout: top (motors + commands) | bottom (log + input)
+    // Overall layout: top (motors + commands + params) | bottom (log + input)
     let main_chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Percentage(45), Constraint::Percentage(55)])
         .split(frame.area());
 
-    // Top area: motors (left) | commands (right)
-    let top_chunks = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(65), Constraint::Percentage(35)])
-        .split(main_chunks[0]);
+    // Top area: motors (left) | commands (center) | params (right)
+    let cmd = Command::ALL[app.selected_cmd];
+    let top_chunks = if cmd.has_params() {
+        Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([
+                Constraint::Percentage(45),
+                Constraint::Percentage(18),
+                Constraint::Percentage(37),
+            ])
+            .split(main_chunks[0])
+    } else {
+        Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([
+                Constraint::Percentage(65),
+                Constraint::Percentage(35),
+                Constraint::Length(0),
+            ])
+            .split(main_chunks[0])
+    };
 
     // Bottom area: log (full width), possibly with input bar
     let bottom_chunks = if app.input_mode {
@@ -983,6 +1188,9 @@ fn ui(frame: &mut Frame, app: &App) {
 
     render_motors(frame, app, top_chunks[0]);
     render_commands(frame, app, top_chunks[1]);
+    if cmd.has_params() {
+        render_params(frame, app, top_chunks[2]);
+    }
     render_log(frame, app, bottom_chunks[0]);
     if app.input_mode {
         render_input(frame, app, bottom_chunks[1]);
@@ -1158,6 +1366,135 @@ fn render_commands(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(list, area);
 }
 
+fn render_params(frame: &mut Frame, app: &App, area: Rect) {
+    let cmd = Command::ALL[app.selected_cmd];
+    let title = format!(" {} Params ", cmd.label());
+
+    let border_style = if app.focus == Focus::Params {
+        Style::default().fg(Color::Cyan)
+    } else {
+        Style::default().fg(Color::White)
+    };
+
+    if app.params.is_empty() {
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .title(title)
+            .border_style(border_style);
+        let p = Paragraph::new("  (no parameters)")
+            .style(Style::default().fg(Color::DarkGray))
+            .block(block);
+        frame.render_widget(p, area);
+        return;
+    }
+
+    let inner = area.inner(Margin { vertical: 1, horizontal: 1 });
+
+    // Render the block border first
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(title)
+        .border_style(border_style);
+    frame.render_widget(block, area);
+
+    // Render each parameter as a row
+    let name_width = app.params.iter().map(|p| p.name.len()).max().unwrap_or(6).max(6);
+
+    for (i, param) in app.params.iter().enumerate() {
+        if i as u16 >= inner.height {
+            break;
+        }
+        let row_area = Rect {
+            x: inner.x,
+            y: inner.y + i as u16,
+            width: inner.width,
+            height: 1,
+        };
+
+        let is_selected = i == app.selected_param && app.focus == Focus::Params;
+        let is_editing = is_selected && app.editing_param;
+
+        // Name part
+        let name_style = if is_selected {
+            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::Yellow)
+        };
+
+        // Value part
+        let (val_str, val_style) = if is_editing {
+            // Show edit buffer with cursor
+            (
+                format!("{}_", app.param_edit_buf),
+                Style::default().fg(Color::White).bg(Color::DarkGray),
+            )
+        } else {
+            (
+                param.value.clone(),
+                if is_selected {
+                    Style::default().fg(Color::White).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(Color::White)
+                },
+            )
+        };
+
+        // Choice indicator
+        let choice_marker = if param.choices.is_some() { "▼" } else { "" };
+
+        let line = Line::from(vec![
+            Span::styled(
+                format!(" {:>width$} ", param.name, width = name_width),
+                name_style,
+            ),
+            Span::styled(val_str, val_style),
+            Span::styled(
+                format!(" {}", choice_marker),
+                Style::default().fg(Color::DarkGray),
+            ),
+        ]);
+
+        frame.render_widget(Paragraph::new(line), row_area);
+
+        // Render description below for selected param
+        if is_selected && !is_editing {
+            // Show desc in the remaining space at bottom, or right after value
+            let desc_y = inner.y + app.params.len().min(inner.height as usize) as u16;
+            if desc_y < inner.y + inner.height {
+                let desc_area = Rect {
+                    x: inner.x,
+                    y: desc_y,
+                    width: inner.width,
+                    height: 1,
+                };
+                let desc_line = Line::from(Span::styled(
+                    format!(" → {}", param.desc),
+                    Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
+                ));
+                frame.render_widget(Paragraph::new(desc_line), desc_area);
+
+                // If choices, show them on next line
+                if let Some(choices) = param.choices {
+                    let choices_y = desc_y + 1;
+                    if choices_y < inner.y + inner.height {
+                        let choices_area = Rect {
+                            x: inner.x,
+                            y: choices_y,
+                            width: inner.width,
+                            height: 1,
+                        };
+                        let choices_line = Line::from(Span::styled(
+                            format!("   [{}]", choices),
+                            Style::default().fg(Color::DarkGray),
+                        ));
+                        frame.render_widget(Paragraph::new(choices_line), choices_area);
+                    }
+                }
+            }
+        }
+    }
+}
+
 fn render_log(frame: &mut Frame, app: &App, area: Rect) {
     let inner_height = area.height.saturating_sub(2) as usize;
     let total = app.log.len();
@@ -1192,14 +1529,9 @@ fn render_log(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 fn render_input(frame: &mut Frame, app: &App, area: Rect) {
-    let hint = app
-        .pending_cmd
-        .map(|c| c.input_hint())
-        .unwrap_or("");
     let title = format!(
-        " Input: {} – {} ",
+        " Input: {} ",
         app.pending_cmd.map(|c| c.label()).unwrap_or("?"),
-        hint,
     );
     let paragraph = Paragraph::new(format!("{}_", app.input_buf))
         .block(
@@ -1211,9 +1543,6 @@ fn render_input(frame: &mut Frame, app: &App, area: Rect) {
         .style(Style::default().fg(Color::Yellow));
 
     frame.render_widget(paragraph, area);
-
-    // Show hint below title
-
 }
 
 fn render_bilateral_overlay(frame: &mut Frame, app: &App) {
