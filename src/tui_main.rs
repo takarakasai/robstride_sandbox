@@ -3,6 +3,7 @@
 //! Interactive terminal application for controlling Robstride motors via CAN bus.
 //! Uses Ratatui + Crossterm for the terminal interface.
 
+use std::collections::HashMap;
 use std::io;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -13,10 +14,58 @@ use crossterm::terminal::{self, EnterAlternateScreen, LeaveAlternateScreen};
 use crossterm::ExecutableCommand;
 use ratatui::prelude::*;
 use ratatui::widgets::*;
+use serde::{Deserialize, Serialize};
 
 use robstride_sandbox::bilateral::{self, AssistTestConfig, BilateralConfig, BilateralGains, BilateralMethod, SharedTelemetry, StopFlag};
 use robstride_sandbox::motor::Motor;
 use robstride_sandbox::protocol::{MotorFeedback, MotorModel, ParamIndex, RunMode};
+
+const APP_NAME: &str = "robstride_sandbox";
+
+// =============================================================================
+// Persistent config
+// =============================================================================
+
+/// Saved parameter values, keyed by command label then param name.
+/// Stored in `~/.config/robstride_sandbox/default-config.toml`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct AppConfig {
+    /// { "Bilateral" => { "kp" => "5.0", "kd" => "0.3", ... }, ... }
+    params: HashMap<String, HashMap<String, String>>,
+}
+
+impl Default for AppConfig {
+    fn default() -> Self {
+        AppConfig {
+            params: HashMap::new(),
+        }
+    }
+}
+
+impl AppConfig {
+    fn load() -> Self {
+        confy::load(APP_NAME, None).unwrap_or_default()
+    }
+
+    fn save(&self) {
+        if let Err(e) = confy::store(APP_NAME, None, self) {
+            eprintln!("Config save error: {}", e);
+        }
+    }
+
+    /// Get saved value for a command param, if it exists.
+    fn get_param(&self, cmd_label: &str, param_name: &str) -> Option<&String> {
+        self.params.get(cmd_label)?.get(param_name)
+    }
+
+    /// Set a saved value for a command param.
+    fn set_param(&mut self, cmd_label: &str, param_name: &str, value: &str) {
+        self.params
+            .entry(cmd_label.to_string())
+            .or_default()
+            .insert(param_name.to_string(), value.to_string());
+    }
+}
 
 // =============================================================================
 // App state
@@ -52,6 +101,8 @@ struct ParamField {
     name: &'static str,
     /// Current value as string
     value: String,
+    /// Default value as string
+    default: String,
     /// Description / hint
     desc: &'static str,
     /// Is this an enum-like choice? (list options separated by |)
@@ -63,6 +114,7 @@ impl ParamField {
         ParamField {
             name,
             value: value.to_string(),
+            default: value.to_string(),
             desc,
             choices: None,
         }
@@ -72,6 +124,7 @@ impl ParamField {
         ParamField {
             name,
             value: value.to_string(),
+            default: value.to_string(),
             desc,
             choices: Some(choices),
         }
@@ -129,11 +182,13 @@ fn params_for_command(cmd: Command) -> Vec<ParamField> {
             ParamField::new("acc_cut", "50.0", "Accel LPF cutoff [rad/s]"),
             ParamField::new("assist_kd", "0.3", "Leader motor-internal kd assist"),
             ParamField::new("vel_ahead", "2.0", "Vel ref lookahead (1=off, 2-3 typ)"),
+            ParamField::new("max_assist", "0.05", "Max assist torque [Nm] (safety limit)"),
         ],
         Command::AssistTest => vec![
             ParamField::new("motor_id", "10", "Motor CAN ID to test"),
             ParamField::new("assist_kd", "0.0", "Motor-internal kd assist [Nm·s/rad] (0=off)"),
             ParamField::new("vel_ahead", "2.0", "Vel ref lookahead (1=off, 2-3 typ)"),
+            ParamField::new("max_assist", "0.05", "Max assist torque [Nm] (safety limit)"),
             ParamField::new("coulomb", "0.0", "Coulomb friction comp [Nm] (0=off)"),
             ParamField::new("viscous", "0.0", "Viscous friction comp [Nm·s/rad] (0=off)"),
             ParamField::new("inertia", "0.005", "Motor inertia [kg·m²]"),
@@ -258,10 +313,19 @@ struct App {
     editing_param: bool,
     /// Edit buffer for inline param editing
     param_edit_buf: String,
+    /// Persistent user config (saved to disk)
+    config: AppConfig,
 }
 
 impl App {
     fn new(interface: &str, host_id: u8, model: MotorModel) -> Self {
+        let config = AppConfig::load();
+        let initial_cmd = Command::ALL[0];
+        let params = Self::apply_config_to_params(
+            params_for_command(initial_cmd),
+            initial_cmd.label(),
+            &config,
+        );
         App {
             interface: interface.to_string(),
             host_id,
@@ -283,10 +347,11 @@ impl App {
             scan_results: Arc::new(Mutex::new(Vec::new())),
             bilateral_telemetry: None,
             bilateral_stop: None,
-            params: params_for_command(Command::ALL[0]),
+            params,
             selected_param: 0,
             editing_param: false,
             param_edit_buf: String::new(),
+            config,
         }
     }
 
@@ -806,15 +871,16 @@ impl App {
         if parts.len() > 0 { cfg.motor_id = parts[0].parse().unwrap_or(cfg.motor_id); }
         if parts.len() > 1 { cfg.assist_kd = parts[1].parse().unwrap_or(cfg.assist_kd); }
         if parts.len() > 2 { cfg.vel_ahead = parts[2].parse().unwrap_or(cfg.vel_ahead); }
-        if parts.len() > 3 { cfg.coulomb_friction = parts[3].parse().unwrap_or(cfg.coulomb_friction); }
-        if parts.len() > 4 { cfg.viscous_friction = parts[4].parse().unwrap_or(cfg.viscous_friction); }
-        if parts.len() > 5 { cfg.inertia = parts[5].parse().unwrap_or(cfg.inertia); }
-        if parts.len() > 6 { cfg.inertia_comp = parts[6].parse().unwrap_or(cfg.inertia_comp); }
-        if parts.len() > 7 { cfg.accel_cutoff = parts[7].parse().unwrap_or(cfg.accel_cutoff); }
+        if parts.len() > 3 { cfg.max_assist = parts[3].parse().unwrap_or(cfg.max_assist); }
+        if parts.len() > 4 { cfg.coulomb_friction = parts[4].parse().unwrap_or(cfg.coulomb_friction); }
+        if parts.len() > 5 { cfg.viscous_friction = parts[5].parse().unwrap_or(cfg.viscous_friction); }
+        if parts.len() > 6 { cfg.inertia = parts[6].parse().unwrap_or(cfg.inertia); }
+        if parts.len() > 7 { cfg.inertia_comp = parts[7].parse().unwrap_or(cfg.inertia_comp); }
+        if parts.len() > 8 { cfg.accel_cutoff = parts[8].parse().unwrap_or(cfg.accel_cutoff); }
 
         self.log_msg(format!(
-            "Starting Assist Test: ID={}, kd={:.2}, vel_ah={:.1}, Cf={:.3}, Vf={:.3}, J={:.4}, IC={:.1}, AC={:.0}",
-            cfg.motor_id, cfg.assist_kd, cfg.vel_ahead,
+            "Starting Assist Test: ID={}, kd={:.2}, vel_ah={:.1}, maxA={:.3}, Cf={:.3}, Vf={:.3}, J={:.4}, IC={:.1}, AC={:.0}",
+            cfg.motor_id, cfg.assist_kd, cfg.vel_ahead, cfg.max_assist,
             cfg.coulomb_friction, cfg.viscous_friction,
             cfg.inertia, cfg.inertia_comp, cfg.accel_cutoff,
         ));
@@ -885,6 +951,9 @@ impl App {
         }
         if parts.len() > 11 {
             gains.vel_ahead = parts[11].parse().unwrap_or(gains.vel_ahead);
+        }
+        if parts.len() > 12 {
+            gains.max_assist = parts[12].parse().unwrap_or(gains.max_assist);
         }
 
         let config = BilateralConfig {
@@ -1009,8 +1078,36 @@ impl App {
                 nf
             })
             .collect();
-        self.params = merged;
+        // Apply saved config values on top
+        self.params = Self::apply_config_to_params(merged, cmd.label(), &self.config);
         self.selected_param = 0;
+    }
+
+    /// Apply saved config values to param fields (overrides defaults).
+    fn apply_config_to_params(
+        params: Vec<ParamField>,
+        cmd_label: &str,
+        config: &AppConfig,
+    ) -> Vec<ParamField> {
+        params
+            .into_iter()
+            .map(|mut pf| {
+                if let Some(saved) = config.get_param(cmd_label, pf.name) {
+                    pf.value = saved.clone();
+                }
+                pf
+            })
+            .collect()
+    }
+
+    /// Save current params of the current command to config.
+    fn save_current_params(&mut self) {
+        let cmd = Command::ALL[self.selected_cmd];
+        let label = cmd.label();
+        for pf in &self.params {
+            self.config.set_param(label, pf.name, &pf.value);
+        }
+        self.config.save();
     }
 
     fn handle_key(&mut self, key: KeyEvent) {
@@ -1041,6 +1138,7 @@ impl App {
                     // Apply edited value
                     if self.selected_param < self.params.len() {
                         self.params[self.selected_param].value = self.param_edit_buf.clone();
+                        self.save_current_params();
                     }
                     self.editing_param = false;
                     self.param_edit_buf.clear();
@@ -1497,7 +1595,12 @@ fn render_params(frame: &mut Frame, app: &App, area: Rect) {
             )
         };
 
-        // Choice indicator
+        // Choice indicator + default value hint
+        let default_hint = if param.value != param.default {
+            format!(" (def:{})", param.default)
+        } else {
+            String::new()
+        };
         let choice_marker = if param.choices.is_some() { "▼" } else { "" };
 
         let line = Line::from(vec![
@@ -1507,7 +1610,7 @@ fn render_params(frame: &mut Frame, app: &App, area: Rect) {
             ),
             Span::styled(val_str, val_style),
             Span::styled(
-                format!(" {}", choice_marker),
+                format!(" {}{}", choice_marker, default_hint),
                 Style::default().fg(Color::DarkGray),
             ),
         ]);

@@ -107,6 +107,11 @@ pub struct BilateralGains {
     /// vel_ref = measured_vel * vel_ahead.
     /// 1.5-3.0 typical. Higher = more aggressive assist.
     pub vel_ahead: f64,
+    /// Maximum velocity-assist torque [Nm].
+    /// Limits the motor-internal kd contribution to prevent runaway.
+    /// The vel_ref delta is clamped so kd*(vel_ref - vel) <= max_assist.
+    /// 0.05 Nm typical (should be less than mechanical friction).
+    pub max_assist: f64,
 }
 
 impl Default for BilateralGains {
@@ -123,6 +128,7 @@ impl Default for BilateralGains {
             accel_cutoff: 50.0,
             assist_kd: 0.0,
             vel_ahead: 2.0,
+            max_assist: 0.05,
         }
     }
 }
@@ -579,13 +585,28 @@ fn run_bilateral_loop(
         let (mit_kd_leader, mit_vel_leader) = if config.gains.assist_kd > 0.0 {
             // vel_ref slightly ahead of current velocity → motor assists motion
             // Ramp up kd for safety during soft-start
-            let vel_ref = prev_l_vel * config.gains.vel_ahead;
-            (config.gains.assist_kd * ramp, vel_ref)
+            // Clamp vel delta so assist torque <= max_assist
+            let kd_ramped = config.gains.assist_kd * ramp;
+            let vel_delta = prev_l_vel * (config.gains.vel_ahead - 1.0);
+            let max_delta = if kd_ramped > 0.0 {
+                config.gains.max_assist / kd_ramped
+            } else {
+                0.0
+            };
+            let vel_ref = prev_l_vel + vel_delta.clamp(-max_delta, max_delta);
+            (kd_ramped, vel_ref)
         } else {
             (0.0, 0.0)
         };
         let leader_vel_assist_est = if config.gains.assist_kd > 0.0 {
-            config.gains.assist_kd * ramp * (config.gains.vel_ahead - 1.0) * prev_l_vel
+            let vel_delta = prev_l_vel * (config.gains.vel_ahead - 1.0);
+            let kd_ramped = config.gains.assist_kd * ramp;
+            let max_delta = if kd_ramped > 0.0 {
+                config.gains.max_assist / kd_ramped
+            } else {
+                0.0
+            };
+            kd_ramped * vel_delta.clamp(-max_delta, max_delta)
         } else {
             0.0
         };
@@ -703,6 +724,9 @@ pub struct AssistTestConfig {
     pub inertia_comp: f64,
     /// Acceleration LPF cutoff [rad/s]
     pub accel_cutoff: f64,
+    /// Maximum velocity-assist torque [Nm].
+    /// Limits the motor-internal kd contribution to prevent runaway.
+    pub max_assist: f64,
     /// Target loop period [µs]
     pub loop_period_us: u64,
 }
@@ -721,6 +745,7 @@ impl Default for AssistTestConfig {
             inertia: 0.005,
             inertia_comp: 0.0,
             accel_cutoff: 50.0,
+            max_assist: 0.05,
             loop_period_us: 2000,
         }
     }
@@ -820,12 +845,27 @@ fn run_assist_test_loop(
 
         // Motor-internal velocity assist (with soft-start ramp)
         let (mit_kd, mit_vel) = if config.assist_kd > 0.0 {
-            (config.assist_kd * ramp, prev_vel * config.vel_ahead)
+            let kd_ramped = config.assist_kd * ramp;
+            let vel_delta = prev_vel * (config.vel_ahead - 1.0);
+            let max_delta = if kd_ramped > 0.0 {
+                config.max_assist / kd_ramped
+            } else {
+                0.0
+            };
+            let vel_ref = prev_vel + vel_delta.clamp(-max_delta, max_delta);
+            (kd_ramped, vel_ref)
         } else {
             (0.0, 0.0)
         };
         let vel_assist_est = if config.assist_kd > 0.0 {
-            config.assist_kd * ramp * (config.vel_ahead - 1.0) * prev_vel
+            let vel_delta = prev_vel * (config.vel_ahead - 1.0);
+            let kd_ramped = config.assist_kd * ramp;
+            let max_delta = if kd_ramped > 0.0 {
+                config.max_assist / kd_ramped
+            } else {
+                0.0
+            };
+            kd_ramped * vel_delta.clamp(-max_delta, max_delta)
         } else {
             0.0
         };
