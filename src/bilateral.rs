@@ -123,6 +123,11 @@ pub struct BilateralGains {
     /// Leader is enabled only when |follower_torque| > this value.
     /// Hysteresis: disables when < threshold * 0.5.
     pub force_threshold: f64,
+    /// Sign of "opening" direction velocity for OnDemand mode.
+    /// +1.0 = positive velocity is opening (disable leader).
+    /// -1.0 = negative velocity is opening.
+    /// 0.0  = direction-based disable is off.
+    pub open_sign: f64,
 }
 
 impl Default for BilateralGains {
@@ -141,6 +146,7 @@ impl Default for BilateralGains {
             vel_ahead: 2.0,
             max_assist: 0.05,
             force_threshold: 0.3,
+            open_sign: 0.0,
         }
     }
 }
@@ -782,6 +788,7 @@ fn run_ondemand_loop(
     let kd = config.gains.kd;
     let force_threshold = config.gains.force_threshold.abs().max(0.01);
     let force_scale = config.gains.force_scale;
+    let open_sign = config.gains.open_sign;
     let coulomb = config.gains.coulomb_friction;
     let viscous = config.gains.viscous_friction;
     let loop_period = Duration::from_micros(config.loop_period_us);
@@ -855,7 +862,13 @@ fn run_ondemand_loop(
 
         // --- Leader enable/disable logic with hysteresis ---
         let mut tau_leader_cmd: f64 = 0.0;
-        if !leader_enabled && follower_force > force_threshold {
+
+        // Direction-based enable gate: if leader moves in "opening" direction,
+        // prevent enable (keeps leader free). Does NOT force-disable during
+        // active contact to avoid ON/OFF oscillation from reaction torque.
+        let opening = open_sign != 0.0 && (l_vel * open_sign) > 0.1;
+
+        if !leader_enabled && !opening && follower_force > force_threshold {
             // Contact detected -> enable leader for force feedback
             can_enable(&socket, host, lid)?;
             std::thread::sleep(Duration::from_millis(5));
