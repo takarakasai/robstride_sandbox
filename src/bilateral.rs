@@ -781,6 +781,7 @@ fn run_ondemand_loop(
     let kp = config.gains.kp;
     let kd = config.gains.kd;
     let force_threshold = config.gains.force_threshold.abs().max(0.01);
+    let force_scale = config.gains.force_scale;
     let coulomb = config.gains.coulomb_friction;
     let viscous = config.gains.viscous_friction;
     let loop_period = Duration::from_micros(config.loop_period_us);
@@ -867,15 +868,19 @@ fn run_ondemand_loop(
                 let _ = can_disable(&socket, host, lid);
                 leader_enabled = false;
             } else {
-                // --- Leader: MIT internal position coupling to follower (10kHz) ---
-                // Motor internally computes: τ = kp*(follower_pos - leader_pos) + kd*(...)
-                // This gives rigid bidirectional coupling — leader is constrained
-                // to follower's actual position, which is blocked by the object.
-                let mit_kp_l = kp * ramp;
-                let mit_kd_l = kd * ramp;
+                // --- Leader: torque reflection from follower ---
+                // Reflects the actual environment force measured by follower.
+                // This preserves the true impedance of the contacted object:
+                //   soft object → small follower torque → soft feel at leader
+                //   hard object → large follower torque → hard feel at leader
+                //
+                // The follower is tracking leader at 10kHz (MIT internal kp/kd),
+                // so fb_f.torque accurately represents the environment reaction.
+                tau_leader_cmd = (-force_scale * fb_f.torque * ramp)
+                    .clamp(-torque_limit, torque_limit);
                 let fb_l = match mit_exchange(
                     &socket, host, lid, &scales,
-                    fb_f.position, fb_f.velocity, mit_kp_l, mit_kd_l, 0.0,
+                    0.0, 0.0, 0.0, 0.0, tau_leader_cmd,
                 ) {
                     Ok(fb) => fb,
                     Err(_) => {
@@ -883,8 +888,6 @@ fn run_ondemand_loop(
                         continue;
                     }
                 };
-                tau_leader_cmd = mit_kp_l * (fb_f.position - fb_l.position)
-                    + mit_kd_l * (fb_f.velocity - fb_l.velocity);
                 // Update leader state from actual feedback
                 prev_l_pos = fb_l.position;
                 prev_l_vel = fb_l.velocity;
