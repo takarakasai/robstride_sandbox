@@ -54,6 +54,14 @@ pub trait MotorDriver: Send {
     /// session value without re-running [`MotorDriver::set_soft_zero`]).
     fn set_soft_zero_offset(&mut self, offset: f64);
 
+    /// Whether this motor's position/velocity/torque are flipped relative
+    /// to the host frame. Used to reconcile vendors that disagree on which
+    /// rotation direction is "positive" (e.g. Robstride and DAMIAO).
+    fn invert(&self) -> bool;
+
+    /// Set the polarity-flip flag (see [`MotorDriver::invert`]).
+    fn set_invert(&mut self, invert: bool);
+
     /// Send one MIT-mode command frame and return the resulting feedback.
     ///
     /// `position` [rad], `velocity` [rad/s], `kp` [Nm/rad], `kd` [Nm·s/rad],
@@ -141,6 +149,7 @@ pub struct RobstrideDriver {
     model: MotorModel,
     scales: MitScales,
     soft_zero: f64,
+    invert: bool,
 }
 
 impl RobstrideDriver {
@@ -151,7 +160,12 @@ impl RobstrideDriver {
             model,
             scales: MitScales::for_model(model),
             soft_zero: 0.0,
+            invert: false,
         }
+    }
+
+    fn sign(&self) -> f64 {
+        if self.invert { -1.0 } else { 1.0 }
     }
 
     pub fn motor_id(&self) -> u8 {
@@ -206,6 +220,14 @@ impl MotorDriver for RobstrideDriver {
         self.soft_zero = offset;
     }
 
+    fn invert(&self) -> bool {
+        self.invert
+    }
+
+    fn set_invert(&mut self, invert: bool) {
+        self.invert = invert;
+    }
+
     fn mit_exchange(
         &mut self,
         socket: &CanSocket,
@@ -215,17 +237,21 @@ impl MotorDriver for RobstrideDriver {
         kd: f64,
         torque: f64,
     ) -> Result<Feedback> {
-        // Apply soft-zero on the way out so the user's "0 rad" command lands
-        // at the physical position captured at soft-zero time.
+        // soft_zero is stored in the motor's RAW frame so it is
+        // polarity-independent (toggling invert after calibration still
+        // leaves 0 = the calibration pose):
+        //   command  = sign*host_pos + raw_offset
+        //   feedback = sign*(raw - raw_offset)
+        let sign = self.sign();
         let (can_id, data) = build_mit_frame(
             self.host_id,
             self.motor_id,
             &self.scales,
-            position + self.soft_zero,
-            velocity,
+            sign * position + self.soft_zero,
+            sign * velocity,
             kp,
             kd,
-            torque,
+            sign * torque,
         );
         send_can(socket, can_id, &data)?;
 
@@ -240,7 +266,9 @@ impl MotorDriver for RobstrideDriver {
                 let raw = build_can_id_raw(ct, extra, dev);
                 if let Some(mut fb) = parse_status_frame(raw, &rdata, &self.scales) {
                     if fb.motor_id == self.motor_id {
-                        fb.position -= self.soft_zero;
+                        fb.position = sign * (fb.position - self.soft_zero);
+                        fb.velocity = sign * fb.velocity;
+                        fb.torque = sign * fb.torque;
                         return Ok(fb);
                     }
                 }
@@ -250,11 +278,11 @@ impl MotorDriver for RobstrideDriver {
 
     fn read_position(&mut self, socket: &CanSocket) -> Result<f64> {
         let raw = self.read_param(socket, ParamIndex::MechPos)? as f64;
-        Ok(raw - self.soft_zero)
+        Ok(self.sign() * (raw - self.soft_zero))
     }
 
     fn read_velocity(&mut self, socket: &CanSocket) -> Result<f64> {
-        Ok(self.read_param(socket, ParamIndex::MechVel)? as f64)
+        Ok(self.sign() * self.read_param(socket, ParamIndex::MechVel)? as f64)
     }
 
     fn torque_limit(&self) -> f64 {
@@ -269,7 +297,8 @@ impl MotorDriver for RobstrideDriver {
 /// Shared soft-zero logic for any driver that can read its current position
 /// via an MIT-zero exchange while enabled. Resets the existing offset first
 /// so the read returns the raw physical position, then stores that as the
-/// new offset.
+/// new offset. The stored offset is in the motor's raw frame, so a later
+/// invert toggle leaves the calibration intact.
 fn soft_zero_via_mit<D: MotorDriver + ?Sized>(driver: &mut D, socket: &CanSocket) -> Result<()> {
     driver.set_soft_zero_offset(0.0);
     driver.enable(socket)?;
@@ -280,7 +309,9 @@ fn soft_zero_via_mit<D: MotorDriver + ?Sized>(driver: &mut D, socket: &CanSocket
     // hot.
     let _ = driver.disable(socket);
     let fb = fb_result?;
-    driver.set_soft_zero_offset(fb.position);
+    // With offset=0, mit_exchange returned sign*raw. Undo sign to get raw.
+    let sign = if driver.invert() { -1.0 } else { 1.0 };
+    driver.set_soft_zero_offset(sign * fb.position);
     Ok(())
 }
 
@@ -393,6 +424,7 @@ pub struct DamiaoDriver {
     model: DamiaoModel,
     limits: DamiaoLimits,
     soft_zero: f64,
+    invert: bool,
 }
 
 impl DamiaoDriver {
@@ -403,7 +435,12 @@ impl DamiaoDriver {
             model,
             limits: DamiaoLimits::for_model(model),
             soft_zero: 0.0,
+            invert: false,
         }
+    }
+
+    fn sign(&self) -> f64 {
+        if self.invert { -1.0 } else { 1.0 }
     }
 
     pub fn can_id(&self) -> u8 {
@@ -496,6 +533,14 @@ impl MotorDriver for DamiaoDriver {
         self.soft_zero = offset;
     }
 
+    fn invert(&self) -> bool {
+        self.invert
+    }
+
+    fn set_invert(&mut self, invert: bool) {
+        self.invert = invert;
+    }
+
     fn mit_exchange(
         &mut self,
         socket: &CanSocket,
@@ -505,17 +550,22 @@ impl MotorDriver for DamiaoDriver {
         kd: f64,
         torque: f64,
     ) -> Result<Feedback> {
+        // soft_zero in raw frame (polarity-independent). See RobstrideDriver
+        // for the math derivation.
+        let sign = self.sign();
         let data = pack_damiao_mit(
-            position + self.soft_zero,
-            velocity,
+            sign * position + self.soft_zero,
+            sign * velocity,
             kp,
             kd,
-            torque,
+            sign * torque,
             &self.limits,
         );
         self.send_std(socket, &data)?;
         let mut fb = self.recv_feedback(socket, Duration::from_millis(10))?;
-        fb.position -= self.soft_zero;
+        fb.position = sign * (fb.position - self.soft_zero);
+        fb.velocity = sign * fb.velocity;
+        fb.torque = sign * fb.torque;
         Ok(fb)
     }
 
@@ -688,6 +738,7 @@ pub enum MotorSpec {
         can_id: u8,
         model: MotorModel,
         soft_zero: f64,
+        invert: bool,
     },
     Damiao {
         /// Motor's TX address (its `CAN_ID` register).
@@ -698,6 +749,7 @@ pub enum MotorSpec {
         master_id: u16,
         model: DamiaoModel,
         soft_zero: f64,
+        invert: bool,
     },
 }
 
@@ -709,6 +761,7 @@ impl MotorSpec {
             can_id,
             model,
             soft_zero: 0.0,
+            invert: false,
         }
     }
 
@@ -720,6 +773,7 @@ impl MotorSpec {
             master_id,
             model,
             soft_zero: 0.0,
+            invert: false,
         }
     }
 
@@ -732,6 +786,15 @@ impl MotorSpec {
         self
     }
 
+    /// Return a copy of this spec with the polarity flag replaced.
+    pub fn with_invert(mut self, flip: bool) -> Self {
+        match &mut self {
+            MotorSpec::Robstride { invert, .. } => *invert = flip,
+            MotorSpec::Damiao { invert, .. } => *invert = flip,
+        }
+        self
+    }
+
     /// Build the concrete driver for this spec, seeded with `soft_zero`.
     pub fn build(&self) -> Box<dyn MotorDriver> {
         match *self {
@@ -740,9 +803,11 @@ impl MotorSpec {
                 can_id,
                 model,
                 soft_zero,
+                invert,
             } => {
                 let mut d = RobstrideDriver::new(host_id, can_id, model);
                 d.set_soft_zero_offset(soft_zero);
+                d.set_invert(invert);
                 Box::new(d)
             }
             MotorSpec::Damiao {
@@ -750,9 +815,11 @@ impl MotorSpec {
                 master_id,
                 model,
                 soft_zero,
+                invert,
             } => {
                 let mut d = DamiaoDriver::new(can_id, master_id, model);
                 d.set_soft_zero_offset(soft_zero);
+                d.set_invert(invert);
                 Box::new(d)
             }
         }

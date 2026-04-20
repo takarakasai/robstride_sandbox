@@ -234,9 +234,13 @@ fn params_for_command(cmd: Command) -> Vec<ParamField> {
             ParamField::with_choices("lead_kind", "rs05", "Leader motor kind",
                 MOTOR_KIND_CHOICES),
             ParamField::new("lead_id", "10", "Leader CAN ID"),
+            ParamField::with_choices("lead_inv", "0", "Leader polarity flip (1 to invert sign)",
+                "0|1"),
             ParamField::with_choices("foll_kind", "rs05", "Follower motor kind",
                 MOTOR_KIND_CHOICES),
             ParamField::new("foll_id", "1", "Follower CAN ID"),
+            ParamField::with_choices("foll_inv", "0", "Follower polarity flip (1 to invert sign)",
+                "0|1"),
             ParamField::with_choices("method", "coupling", "Control method",
                 "pos|force|coupling|mode|ondemand"),
             ParamField::new("kp", "5.0", "Spring stiffness [Nm/rad]"),
@@ -1192,14 +1196,17 @@ impl App {
         }
 
         // Param order matches Command::Bilateral in params_for_command:
-        //   0: lead_kind, 1: lead_id, 2: foll_kind, 3: foll_id, 4: method,
-        //   5: kp, 6: kd, 7: coulomb, 8: viscous, 9: force_scale,
-        //   10: inertia, 11: dob_cutoff, 12: inertia_comp, 13: accel_cutoff,
-        //   14: assist_kd, 15: vel_ahead, 16: max_assist,
-        //   17: force_threshold, 18: open_sign
+        //   0: lead_kind, 1: lead_id, 2: lead_inv,
+        //   3: foll_kind, 4: foll_id, 5: foll_inv,
+        //   6: method, 7: kp, 8: kd, 9: coulomb, 10: viscous, 11: force_scale,
+        //   12: inertia, 13: dob_cutoff, 14: inertia_comp, 15: accel_cutoff,
+        //   16: assist_kd, 17: vel_ahead, 18: max_assist,
+        //   19: force_threshold, 20: open_sign, 21: safety_rad
         let parts: Vec<&str> = input.trim().split_whitespace().collect();
         let get = |i: usize| parts.get(i).copied();
+        let bool_flag = |s: &str| matches!(s.trim(), "1" | "true" | "yes" | "on");
 
+        let lead_invert = get(2).map(bool_flag).unwrap_or(false);
         let (leader, leader_warn) = parse_motor_kind(
             get(0).unwrap_or("rs05"),
             get(1).unwrap_or("10"),
@@ -1208,18 +1215,20 @@ impl App {
             self.default_model,
         );
         if let Some(w) = leader_warn { self.log_msg(format!("Leader: {}", w)); }
-        let leader = self.apply_saved_offset(leader);
+        let leader = self.apply_saved_offset(leader).with_invert(lead_invert);
+
+        let foll_invert = get(5).map(bool_flag).unwrap_or(false);
         let (follower, follower_warn) = parse_motor_kind(
-            get(2).unwrap_or("rs05"),
-            get(3).unwrap_or("1"),
+            get(3).unwrap_or("rs05"),
+            get(4).unwrap_or("1"),
             1,
             self.host_id,
             self.default_model,
         );
         if let Some(w) = follower_warn { self.log_msg(format!("Follower: {}", w)); }
-        let follower = self.apply_saved_offset(follower);
+        let follower = self.apply_saved_offset(follower).with_invert(foll_invert);
 
-        let method_str = get(4).unwrap_or("coupling");
+        let method_str = get(6).unwrap_or("coupling");
         let method = match BilateralMethod::from_short(method_str) {
             Some(m) => m,
             None => {
@@ -1232,25 +1241,25 @@ impl App {
         };
 
         let mut gains = BilateralGains::default();
-        if let Some(s) = get(5) { gains.kp = s.parse().unwrap_or(gains.kp); }
-        if let Some(s) = get(6) { gains.kd = s.parse().unwrap_or(gains.kd); }
-        if let Some(s) = get(7) { gains.coulomb_friction = s.parse().unwrap_or(gains.coulomb_friction); }
-        if let Some(s) = get(8) { gains.viscous_friction = s.parse().unwrap_or(gains.viscous_friction); }
-        if let Some(s) = get(9) { gains.force_scale = s.parse().unwrap_or(gains.force_scale); }
-        if let Some(s) = get(10) { gains.inertia = s.parse().unwrap_or(gains.inertia); }
-        if let Some(s) = get(11) { gains.dob_cutoff = s.parse().unwrap_or(gains.dob_cutoff); }
-        if let Some(s) = get(12) { gains.inertia_comp = s.parse().unwrap_or(gains.inertia_comp); }
-        if let Some(s) = get(13) { gains.accel_cutoff = s.parse().unwrap_or(gains.accel_cutoff); }
-        if let Some(s) = get(14) { gains.assist_kd = s.parse().unwrap_or(gains.assist_kd); }
-        if let Some(s) = get(15) { gains.vel_ahead = s.parse().unwrap_or(gains.vel_ahead); }
-        if let Some(s) = get(16) { gains.max_assist = s.parse().unwrap_or(gains.max_assist); }
-        if let Some(s) = get(17) { gains.force_threshold = s.parse().unwrap_or(gains.force_threshold); }
-        if let Some(s) = get(18) {
+        if let Some(s) = get(7) { gains.kp = s.parse().unwrap_or(gains.kp); }
+        if let Some(s) = get(8) { gains.kd = s.parse().unwrap_or(gains.kd); }
+        if let Some(s) = get(9) { gains.coulomb_friction = s.parse().unwrap_or(gains.coulomb_friction); }
+        if let Some(s) = get(10) { gains.viscous_friction = s.parse().unwrap_or(gains.viscous_friction); }
+        if let Some(s) = get(11) { gains.force_scale = s.parse().unwrap_or(gains.force_scale); }
+        if let Some(s) = get(12) { gains.inertia = s.parse().unwrap_or(gains.inertia); }
+        if let Some(s) = get(13) { gains.dob_cutoff = s.parse().unwrap_or(gains.dob_cutoff); }
+        if let Some(s) = get(14) { gains.inertia_comp = s.parse().unwrap_or(gains.inertia_comp); }
+        if let Some(s) = get(15) { gains.accel_cutoff = s.parse().unwrap_or(gains.accel_cutoff); }
+        if let Some(s) = get(16) { gains.assist_kd = s.parse().unwrap_or(gains.assist_kd); }
+        if let Some(s) = get(17) { gains.vel_ahead = s.parse().unwrap_or(gains.vel_ahead); }
+        if let Some(s) = get(18) { gains.max_assist = s.parse().unwrap_or(gains.max_assist); }
+        if let Some(s) = get(19) { gains.force_threshold = s.parse().unwrap_or(gains.force_threshold); }
+        if let Some(s) = get(20) {
             // Parse +1, -1, 0 (strip leading '+')
             let trimmed = s.trim_start_matches('+');
             gains.open_sign = trimmed.parse().unwrap_or(gains.open_sign);
         }
-        let safety_radius: f64 = get(19)
+        let safety_radius: f64 = get(21)
             .and_then(|s| s.parse().ok())
             .unwrap_or(std::f64::consts::PI);
 
