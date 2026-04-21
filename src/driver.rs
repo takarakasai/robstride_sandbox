@@ -345,9 +345,9 @@ fn soft_zero_via_mit<D: MotorDriver + ?Sized>(driver: &mut D, socket: &CanSocket
 
 const DM_ENABLE: [u8; 8] = [0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFC];
 const DM_DISABLE: [u8; 8] = [0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFD];
-// Note: the DAMIAO 0xFE "set zero" magic frame writes to motor NVM; we
-// intentionally do not send it. Soft zero is implemented as an in-memory
-// offset inside the driver — see `soft_zero_via_mit`.
+// FF..FE = "save current position as zero to NVM". Used by
+// damiao_set_zero_nvm — DO NOT call routinely (flash wear).
+const DM_SET_ZERO_NVM: [u8; 8] = [0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFE];
 
 /// DAMIAO motor model.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -663,6 +663,30 @@ pub fn scan_damiao(
     }
 
     Ok(found)
+}
+
+/// Persist the DAMIAO motor's current physical position as its hardware
+/// zero, written to NVM (flash). This is the FF..FE "save zero" command.
+///
+/// **Use sparingly.** Flash has a finite write-cycle budget and a botched
+/// write can leave the joint mis-calibrated. The normal recalibration path
+/// is the in-memory `soft_zero` (see [`MotorDriver::set_soft_zero`]) which
+/// does not touch NVM.
+///
+/// The motor must be present on the bus and addressable at `can_id`. The
+/// motor is sent the magic frame and then given ~50 ms to perform the flash
+/// write before the function returns. Any reply frames during the wait are
+/// drained so the next operation starts on a clean buffer.
+pub fn damiao_set_zero_nvm(socket: &CanSocket, can_id: u8) -> Result<()> {
+    let std_id = StandardId::new(can_id as u16)
+        .expect("DAMIAO CAN_ID must fit in 11 bits");
+    let frame = socketcan::CanFrame::new(Id::Standard(std_id), &DM_SET_ZERO_NVM)
+        .expect("8-byte DM_SET_ZERO_NVM fits a CAN data frame");
+    socket.write_frame(&frame)?;
+    // NVM flash write can take ~10 ms; wait conservatively.
+    std::thread::sleep(Duration::from_millis(50));
+    while socket.read_frame_timeout(Duration::from_millis(1)).is_ok() {}
+    Ok(())
 }
 
 fn pack_damiao_mit(

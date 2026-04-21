@@ -765,17 +765,65 @@ impl App {
         }
     }
 
-    /// Hardware NVM zero (Robstride only). Soft zeros use Zero Pair.
+    /// Persist the current physical position as the motor's hardware zero
+    /// (NVM write). Both vendors are supported. For routine recalibration
+    /// prefer Zero Pair (in-memory) — NVM has finite write endurance.
+    ///
+    /// After a successful NVM write, the raw-frame soft_zero offset cached
+    /// in the App for this motor is also cleared, because the motor's
+    /// reported raw=0 is now this physical pose.
     fn execute_set_zero(&mut self) {
-        let Some((host_id, mid, model)) = self.selected_robstride() else { return; };
-        match Motor::new(&self.interface, mid, host_id, model) {
-            Ok(mut motor) => match motor.set_zero() {
-                Ok(()) => {
-                    self.log_msg(format!("Motor {} zero set (NVM).", mid));
-                }
-                Err(e) => self.log_msg(format!("Set zero failed: {}", e)),
+        if self.selected_motor_id().is_none() {
+            self.log_msg("No motor selected.".to_string());
+            return;
+        }
+        let idx = self.selected_motor;
+        let spec = self.motors[idx].spec.clone();
+        let label = spec.description();
+        let key = spec.key();
+
+        self.log_msg(format!(
+            "WARNING: writing zero to NVM for {} (flash wear — use Zero Pair for routine recalibration)",
+            label
+        ));
+
+        let outcome = match &spec {
+            MotorSpec::Robstride {
+                host_id,
+                can_id,
+                model,
+                ..
+            } => match Motor::new(&self.interface, *can_id, *host_id, *model) {
+                Ok(mut motor) => motor
+                    .set_zero()
+                    .map_err(|e| format!("Set zero failed: {}", e)),
+                Err(e) => Err(format!("CAN open error: {}", e)),
             },
-            Err(e) => self.log_msg(format!("CAN open error: {}", e)),
+            MotorSpec::Damiao { can_id, .. } => match CanSocket::open(&self.interface) {
+                Ok(socket) => {
+                    let _ = socket.set_read_timeout(Duration::from_millis(50));
+                    driver::damiao_set_zero_nvm(&socket, *can_id)
+                        .map_err(|e| format!("Set zero failed: {}", e))
+                }
+                Err(e) => Err(format!("CAN open error: {}", e)),
+            },
+        };
+
+        match outcome {
+            Ok(()) => {
+                self.log_msg(format!("{} zero saved to NVM.", label));
+                // Hardware zero changes the motor's raw frame, so any cached
+                // soft_zero (in raw frame) is now invalid — drop it.
+                if self.soft_zero_offsets.remove(&key).is_some() {
+                    self.log_msg(format!(
+                        "  Cleared cached soft_zero for {} (no longer needed).",
+                        label
+                    ));
+                }
+                // The previous feedback reading also reflects the old frame.
+                self.motors[idx].feedback = None;
+            }
+            Err(msg) => self.log_msg(msg),
         }
     }
 
