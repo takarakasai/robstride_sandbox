@@ -138,6 +138,26 @@ pub struct BilateralGains {
     /// -1.0 = negative velocity is opening.
     /// 0.0  = direction-based disable is off.
     pub open_sign: f64,
+    /// Cutoff frequency [rad/s] for the velocity feedback LPF used by the
+    /// coupling kd term. Direct-drive motors (Robstride RS-series, Damiao
+    /// DM-series) typically report a velocity that is *itself* internally
+    /// filtered with significant phase lag — feeding that lagged signal
+    /// into our kd term causes the closed loop to ring at the lag
+    /// frequency. A second LPF in software is the wrong cure, but a
+    /// numerical-differentiation estimator with a controlled cutoff
+    /// gives stable damping. Set <= 0 to bypass (use raw motor velocity).
+    /// Typical: 80-200 rad/s.
+    pub vel_cutoff: f64,
+    /// Maximum allowed change in commanded torque per loop cycle [Nm].
+    /// Acts as a slew-rate limiter on the final tau output. When the
+    /// virtual-coupling spring slams from "aligned" to "under operator
+    /// disturbance" it can ask for a multi-Nm torque step in one CAN
+    /// cycle; the motor's current loop overshoots, the operator hand
+    /// reflects energy back, and the system rings. Limiting to ~0.5
+    /// Nm/cycle (= 250 Nm/s at 500 Hz) softens the leading edge of
+    /// transients without slowing steady-state response noticeably.
+    /// Set <= 0 to disable.
+    pub tau_slew: f64,
 }
 
 impl Default for BilateralGains {
@@ -157,6 +177,18 @@ impl Default for BilateralGains {
             max_assist: 0.05,
             force_threshold: 0.3,
             open_sign: 0.0,
+            // Off by default: the LPF estimator helps direct-drive motors
+            // with internally-lagged velocity (some Robstride models) but
+            // *hurts* high-resolution encoders (DAMIAO DM-series) where
+            // the motor's own velocity report is far smoother than what
+            // numerical position differentiation at 500 Hz can produce.
+            // Users opt in per-motor.
+            vel_cutoff: 0.0,
+            // Off by default: a hard slew limit alters steady-state
+            // response and shows up as visible torque steps. Only useful
+            // when the operator-grab transient excites a resonance you
+            // can't damp another way.
+            tau_slew: 0.0,
         }
     }
 }
@@ -336,17 +368,23 @@ impl Default for BilateralConfig {
 /// Compute friction compensation feedforward torque.
 ///
 /// Returns a torque in the direction of motion to overcome internal friction:
-///   τ_comp = coulomb·sign(ω) + viscous·ω
+///   τ_comp = coulomb·smooth_sign(ω) + viscous·ω
 ///
-/// A small dead zone (|ω| < 0.01) avoids sign chatter at zero velocity.
+/// The Coulomb term uses a **smooth** sign approximation rather than the
+/// classical `sign()` step. A pure step at low velocity is the textbook
+/// cause of bilateral-coupling limit cycles: the moment the operator nudges
+/// the leader, its velocity wanders through ±deadband, the friction comp
+/// snaps ±coulomb on/off every other sample, and the closed loop rings at
+/// whatever frequency the coupling permits. Linear ramp through ±deadband
+/// gives the same DC behaviour without the discontinuity.
 fn friction_compensation(velocity: f64, coulomb: f64, viscous: f64) -> f64 {
-    // Deadband 0.05 rad/s to avoid step torque from velocity noise
-    let sign = if velocity.abs() < 0.05 {
-        0.0
-    } else {
-        velocity.signum()
-    };
-    coulomb * sign + viscous * velocity
+    // Smooth sign: linear ramp between -DEADBAND and +DEADBAND, then ±1.
+    // 0.1 rad/s width is small enough to look like proper friction comp
+    // at moderate speeds but wide enough to absorb the encoder velocity
+    // jitter that drives the limit cycle.
+    const DEADBAND: f64 = 0.1;
+    let smooth_sign = (velocity / DEADBAND).clamp(-1.0, 1.0);
+    coulomb * smooth_sign + viscous * velocity
 }
 
 /// Soft-start ramp: linearly ramps from 0 to 1 over `ramp_secs`.
@@ -411,6 +449,31 @@ fn run_bilateral_loop(
     let fb_l = leader.mit_exchange(&socket, 0.0, 0.0, 0.0, 0.0, 0.0)?;
     let fb_f = follower.mit_exchange(&socket, 0.0, 0.0, 0.0, 0.0, 0.0)?;
 
+    // Pre-flight position sanity check. If either motor is already well
+    // outside the safety radius at launch, refuse to engage and tell the
+    // operator how to fix it. Without this the in-loop radius watchdog
+    // trips on cycle 0 — before any telemetry is published — and the user
+    // just sees a fully-zero TUI with a single ERR line, which is hard to
+    // interpret. `2.0 *` margin so we don't refuse for tiny excursions
+    // that the soft-start can quickly pull back; truly far-away motors
+    // (e.g. multi-turn pose with no Zero Pair run) get rejected here.
+    if config.safety_radius > 0.0 {
+        let limit = config.safety_radius * 2.0;
+        if fb_l.position.abs() > limit || fb_f.position.abs() > limit {
+            let _ = leader.disable(&socket);
+            let _ = follower.disable(&socket);
+            if let Ok(mut t) = telemetry.lock() {
+                t.last_error = Some(format!(
+                    "STARTUP: motor outside 2×safety_rad before loop \
+                     (leader pos={:.3}, follower pos={:.3}, safety_rad={:.2}). \
+                     Run 'Zero Pair' or move the motor closer to zero, or raise safety_rad.",
+                    fb_l.position, fb_f.position, config.safety_radius,
+                ));
+            }
+            return Ok(());
+        }
+    }
+
     let mut prev_l_pos = fb_l.position;
     let mut prev_f_pos = fb_f.position;
     let mut prev_l_vel = fb_l.velocity;
@@ -439,11 +502,57 @@ fn run_bilateral_loop(
     let mut leader_prev_vel = prev_l_vel;
     let mut accel_lpf = LowPassFilter::new(config.gains.accel_cutoff);
 
+    // Software velocity estimators. We differentiate position with an LPF
+    // because the raw motor-reported velocity is internally smoothed by an
+    // unknown filter and carries phase lag we cannot afford in the kd
+    // path. If `vel_cutoff <= 0` we fall back to the motor's reported
+    // velocity (legacy behaviour).
+    let use_vel_estimator = config.gains.vel_cutoff > 0.0;
+    let vel_cutoff = if use_vel_estimator { config.gains.vel_cutoff } else { 0.0 };
+    let mut vel_lpf_l = LowPassFilter::new(vel_cutoff);
+    let mut vel_lpf_f = LowPassFilter::new(vel_cutoff);
+    // Seed the filter outputs at the current measured velocity so the
+    // first few cycles don't see a step from 0 to the actual speed.
+    vel_lpf_l.output = fb_l.velocity;
+    vel_lpf_f.output = fb_f.velocity;
+    let mut prev_l_vel_filt: f64 = fb_l.velocity;
+    let mut prev_f_vel_filt: f64 = fb_f.velocity;
+
+    // Slew-rate limited previous output torques (for rate limiter).
+    let mut prev_tau_l_cmd: f64 = 0.0;
+    let mut prev_tau_f_cmd: f64 = 0.0;
+    let tau_slew = config.gains.tau_slew.max(0.0);
+
     // Per-motor torque clamps (50 % of model scale is already applied by the
     // Robstride driver; other vendors apply their own margin).
     let leader_torque_limit = leader.torque_limit();
     let follower_torque_limit = follower.torque_limit();
     let start_time = Instant::now();
+
+    // Per-motor "last successful exchange" timestamps. The jump watchdog
+    // uses the elapsed wall time since the last good frame so that a CAN
+    // dropout (which leaves prev_* stale) doesn't false-trip on the next
+    // good read: at high speed the legitimate position delta across a
+    // 10 ms timeout window can already approach the static threshold.
+    let mut last_good_l = Instant::now();
+    let mut last_good_f = Instant::now();
+    // Plausible maximum joint velocity used to scale the jump threshold
+    // with elapsed time. Bumped to 150 rad/s: the MIT velocity scales we
+    // ship max out at 50 rad/s but those are the *commanded* limits — a
+    // human back-driving the leader (or a low-friction direct-drive motor
+    // whose rotor is geared up to the joint) can easily exceed that for
+    // brief flicks, and we don't want every wrist-flick to trip safety.
+    const SAFETY_MAX_PLAUSIBLE_VEL: f64 = 150.0;
+
+    // Track previous iteration start so loop_hz reports actual loop rate
+    // (work + sleep) rather than the misleading "work-only" rate.
+    let mut prev_iter_start: Option<Instant> = None;
+
+    // Spurious-frame counter (see in-loop docstring on the rejection
+    // logic). Trips safety only after MAX consecutive bad frames; a single
+    // clean frame resets the counter to 0.
+    let mut spurious_count: u32 = 0;
+    const MAX_SPURIOUS_BEFORE_TRIP: u32 = 20;
 
     loop {
         if stop.load(Ordering::Relaxed) {
@@ -459,33 +568,44 @@ fn run_bilateral_loop(
         };
         loop_start = iter_start;
 
+        // Choose velocity signal for the kd path: either the LPF-smoothed
+        // numerical derivative of position, or the motor's raw velocity
+        // (legacy). The estimator avoids the unknown internal LPF lag in
+        // the motor-reported velocity, which is the dominant destabiliser
+        // for bilateral coupling on direct-drive motors.
+        let (vel_l_eff, vel_f_eff) = if use_vel_estimator {
+            (prev_l_vel_filt, prev_f_vel_filt)
+        } else {
+            (prev_l_vel, prev_f_vel)
+        };
+
         // Compute torques based on method
         let (tau_leader, tau_follower) = match config.method {
             BilateralMethod::PositionMirroring => {
-                let tau_l = -0.05 * prev_l_vel;
+                let tau_l = -0.05 * vel_l_eff;
                 let err = prev_l_pos - prev_f_pos;
-                let derr = prev_l_vel - prev_f_vel;
+                let derr = vel_l_eff - vel_f_eff;
                 let tau_f = kp * err + kd * derr;
                 (tau_l, tau_f)
             }
             BilateralMethod::ForceReflecting => {
                 let err = prev_l_pos - prev_f_pos;
-                let derr = prev_l_vel - prev_f_vel;
+                let derr = vel_l_eff - vel_f_eff;
                 let tau_f = kp * err + kd * derr;
-                let tau_l = -config.gains.force_scale * follower_torque_est - 0.05 * prev_l_vel;
+                let tau_l = -config.gains.force_scale * follower_torque_est - 0.05 * vel_l_eff;
                 (tau_l, tau_f)
             }
             BilateralMethod::VirtualCoupling => {
                 let err = prev_l_pos - prev_f_pos;
-                let derr = prev_l_vel - prev_f_vel;
+                let derr = vel_l_eff - vel_f_eff;
                 let coupling = kp * err + kd * derr;
                 (-coupling, coupling)
             }
             BilateralMethod::ModeSpace => {
-                let tau_ext_l = dob_leader.update(0.0, prev_l_vel, dt);
-                let tau_ext_f = dob_follower.update(0.0, prev_f_vel, dt);
+                let tau_ext_l = dob_leader.update(0.0, vel_l_eff, dt);
+                let tau_ext_f = dob_follower.update(0.0, vel_f_eff, dt);
                 let pos_err = prev_l_pos - prev_f_pos;
-                let vel_err = prev_l_vel - prev_f_vel;
+                let vel_err = vel_l_eff - vel_f_eff;
                 let tau_diff = kp * pos_err + kd * vel_err;
                 let tau_l = -tau_diff + tau_ext_f;
                 let tau_f = tau_diff + tau_ext_l;
@@ -509,30 +629,56 @@ fn run_bilateral_loop(
         // Friction compensation feedforward for each motor.
         // This cancels internal motor friction so it does not propagate
         // through the virtual coupling as a phantom force.
-        //   τ_comp = coulomb·sign(ω) + viscous·ω
+        //   τ_comp = coulomb·smooth_sign(ω) + viscous·ω
         // Applied in the direction of existing velocity to overcome friction.
-        let friction_comp_l = friction_compensation(prev_l_vel, coulomb, viscous);
-        let friction_comp_f = friction_compensation(prev_f_vel, coulomb, viscous);
+        // Use the smoothed velocity to avoid re-introducing the
+        // quantisation/jitter we filter out for kd.
+        let friction_comp_l = friction_compensation(vel_l_eff, coulomb, viscous);
+        let friction_comp_f = friction_compensation(vel_f_eff, coulomb, viscous);
 
         // Leader inertia compensation: τ = -J_comp · α_filtered
         // This makes the leader feel lighter by cancelling its own inertia.
         let raw_accel = if dt > 0.0 {
-            (prev_l_vel - leader_prev_vel) / dt
+            (vel_l_eff - leader_prev_vel) / dt
         } else {
             0.0
         };
-        leader_prev_vel = prev_l_vel;
+        leader_prev_vel = vel_l_eff;
         let filtered_accel = accel_lpf.update(raw_accel, dt);
         let inertia_comp_torque = -j_comp * filtered_accel;
 
-        // Apply soft-start ramp to all compensation torques
-        let tau_leader_total = tau_leader + (friction_comp_l + inertia_comp_torque) * ramp;
-        let tau_follower_total = tau_follower + friction_comp_f * ramp;
+        // Apply soft-start ramp to *all* torques. The primary coupling
+        // torque must be ramped too: if the leader/follower aren't
+        // perfectly aligned at launch, an un-ramped kp·err would inject a
+        // step torque at t=0 and ring the closed loop (the symptom users
+        // see as "coupling becomes oscillatory right after starting").
+        let tau_leader_total =
+            tau_leader * ramp + (friction_comp_l + inertia_comp_torque) * ramp;
+        let tau_follower_total = tau_follower * ramp + friction_comp_f * ramp;
+
+        // Slew-rate limit the commanded torque. Bilateral coupling tends
+        // to produce step torques when the operator suddenly grabs either
+        // side: kp · err jumps by several Nm in one cycle, the motor's
+        // current loop overshoots, mechanical reflection rings. Capping
+        // the per-cycle change to `tau_slew` Nm spreads that step over a
+        // few ms and removes the leading edge that excites the lightly-
+        // damped modes of the joint + operator-hand system. `tau_slew=0`
+        // disables (legacy behaviour).
+        let (tau_leader_slewed, tau_follower_slewed) = if tau_slew > 0.0 {
+            let dl = (tau_leader_total - prev_tau_l_cmd).clamp(-tau_slew, tau_slew);
+            let df = (tau_follower_total - prev_tau_f_cmd).clamp(-tau_slew, tau_slew);
+            (prev_tau_l_cmd + dl, prev_tau_f_cmd + df)
+        } else {
+            (tau_leader_total, tau_follower_total)
+        };
 
         // Clamp
-        let tau_leader_clamped = tau_leader_total.clamp(-leader_torque_limit, leader_torque_limit);
+        let tau_leader_clamped =
+            tau_leader_slewed.clamp(-leader_torque_limit, leader_torque_limit);
         let tau_follower_clamped =
-            tau_follower_total.clamp(-follower_torque_limit, follower_torque_limit);
+            tau_follower_slewed.clamp(-follower_torque_limit, follower_torque_limit);
+        prev_tau_l_cmd = tau_leader_clamped;
+        prev_tau_f_cmd = tau_follower_clamped;
 
         // =====================================================================
         // Leader: use motor-internal kd for velocity assist
@@ -597,25 +743,133 @@ fn run_bilateral_loop(
             }
         };
 
+        // Spurious-frame filter.
+        //
+        // Occasionally a single CAN status frame comes back with a
+        // wildly-wrong position even though the motor is essentially
+        // stationary (velocity ~ 0). The root cause is unclear (kernel
+        // buffer reordering across enable / parameter reads, a stale
+        // active-report frame from before set_soft_zero ran, transceiver
+        // glitch, ...) but the signature is clear: |Δpos| is far larger
+        // than what fb.velocity·Δt could physically explain.
+        //
+        // If we hand such a frame to the safety_radius check it trips
+        // immediately on a value that doesn't represent reality. Instead,
+        // treat the frame itself as suspect, keep prev_* unchanged, and
+        // try again next cycle. After too many consecutive rejects we
+        // *do* trip, because at that point the comms are genuinely broken.
+        let now = Instant::now();
+        let dt_l_phys = now.duration_since(last_good_l).as_secs_f64();
+        let dt_f_phys = now.duration_since(last_good_f).as_secs_f64();
+        // Bound the plausible per-frame delta by the *average* of the
+        // two velocity samples (current and previous) times elapsed time,
+        // plus a small slack to absorb encoder quantisation noise.
+        const SPURIOUS_SLACK_RAD: f64 = 0.1;
+        let plausible_dl = 0.5 * (fb_l.velocity.abs() + prev_l_vel.abs()) * dt_l_phys
+            + SPURIOUS_SLACK_RAD;
+        let plausible_df = 0.5 * (fb_f.velocity.abs() + prev_f_vel.abs()) * dt_f_phys
+            + SPURIOUS_SLACK_RAD;
+        let dl_now = (fb_l.position - prev_l_pos).abs();
+        let df_now = (fb_f.position - prev_f_pos).abs();
+        let spurious_l = cycle > 0 && dl_now > plausible_dl * 5.0 + 0.3;
+        let spurious_f = cycle > 0 && df_now > plausible_df * 5.0 + 0.3;
+        if spurious_l || spurious_f {
+            spurious_count += 1;
+            // Surface a soft warning so users can see the frame went
+            // through the rejection path (cleared by the next clean cycle).
+            if let Ok(mut t) = telemetry.lock() {
+                t.last_error = Some(format!(
+                    "WARN spurious frame #{} (leader pos={:.3} v={:.3} Δ={:.3}>{:.3}; \
+                     follower pos={:.3} v={:.3} Δ={:.3}>{:.3}) — dropped",
+                    spurious_count,
+                    fb_l.position, fb_l.velocity, dl_now, plausible_dl * 5.0 + 0.3,
+                    fb_f.position, fb_f.velocity, df_now, plausible_df * 5.0 + 0.3,
+                ));
+            }
+            if spurious_count >= MAX_SPURIOUS_BEFORE_TRIP {
+                if let Ok(mut t) = telemetry.lock() {
+                    t.last_error = Some(format!(
+                        "SAFETY: {} consecutive spurious frames — disabling \
+                         (last leader pos={:.3} v={:.3}, follower pos={:.3} v={:.3})",
+                        spurious_count,
+                        fb_l.position, fb_l.velocity,
+                        fb_f.position, fb_f.velocity,
+                    ));
+                }
+                break;
+            }
+            // Don't update prev_* / last_good_* and don't run the safety
+            // checks on a frame we just rejected. Keep cycling.
+            cycle += 1;
+            let work_time = iter_start.elapsed();
+            if work_time < loop_period {
+                std::thread::sleep(loop_period - work_time);
+            }
+            continue;
+        }
+        spurious_count = 0;
+
         // Jump watchdog: catch the case where CAN dropouts kept prev_*
         // frozen while the motor was physically accelerating, so by the time
         // a fresh frame arrives the position has already moved into a
         // dangerous regime. Skip on cycle 0 — prev_* was seeded from the
         // pre-loop initial exchange and the very first iteration's delta is
         // meaningless if the read timed out then.
-        if cycle > 0 && config.safety_max_jump > 0.0 {
+        //
+        // The threshold is wall-clock aware: it scales with how long it has
+        // been since the last successful read of *that* motor, with
+        // `safety_max_jump` as a floor. Without this, a single CAN timeout
+        // (~10 ms) under high-speed motion makes |Δpos| approach the static
+        // limit (33 rad/s × 10 ms ≈ 0.33 rad on RS-05) and produces a
+        // false-positive trip the instant the next good frame arrives —
+        // which is the "starts and immediately stops with SAFETY error"
+        // symptom in coupling mode.
+        //
+        // During the soft-start ramp (first SOFT_START_SECS) the loop
+        // commands only a fraction of the configured torque, so the motor
+        // cannot be driven into a runaway by *us*; meanwhile the operator
+        // is typically grabbing/aligning the leader by hand and producing
+        // high transient velocities. Skip the jump check during that
+        // window to avoid tripping on legitimate manual motion.
+        let in_softstart = ramp < 1.0;
+        if cycle > 0 && config.safety_max_jump > 0.0 && !in_softstart {
+            let dt_l = now.duration_since(last_good_l).as_secs_f64();
+            let dt_f = now.duration_since(last_good_f).as_secs_f64();
+            let thr_l = config
+                .safety_max_jump
+                .max(SAFETY_MAX_PLAUSIBLE_VEL * dt_l);
+            let thr_f = config
+                .safety_max_jump
+                .max(SAFETY_MAX_PLAUSIBLE_VEL * dt_f);
             let dl = (fb_l.position - prev_l_pos).abs();
             let df = (fb_f.position - prev_f_pos).abs();
-            if dl > config.safety_max_jump || df > config.safety_max_jump {
+            if dl > thr_l || df > thr_f {
                 if let Ok(mut t) = telemetry.lock() {
                     t.last_error = Some(format!(
-                        "SAFETY: position jumped > {:.2} rad/cycle (leader Δ={:.3}, follower Δ={:.3}) — \
-                         likely CAN dropout under motion; disabling",
-                        config.safety_max_jump, dl, df,
+                        "SAFETY: position jump exceeds plausible motion \
+                         (leader Δ={:.3}>{:.3} or follower Δ={:.3}>{:.3}) — disabling",
+                        dl, thr_l, df, thr_f,
                     ));
                 }
                 break;
             }
+        }
+        last_good_l = now;
+        last_good_f = now;
+
+        // Update the LPF velocity estimators from the position derivative.
+        // Use the *new* fb position vs the *previous* prev_pos and the
+        // measured dt. The LPF rejects per-cycle quantisation jitter while
+        // keeping the dominant motion content. The filter output is what
+        // the next iteration's kd term will see (`vel_l_eff` / `vel_f_eff`).
+        if use_vel_estimator && dt > 0.0 {
+            let dl = (fb_l.position - prev_l_pos) / dt;
+            let df = (fb_f.position - prev_f_pos) / dt;
+            prev_l_vel_filt = vel_lpf_l.update(dl, dt);
+            prev_f_vel_filt = vel_lpf_f.update(df, dt);
+        } else {
+            prev_l_vel_filt = fb_l.velocity;
+            prev_f_vel_filt = fb_f.velocity;
         }
 
         prev_l_pos = fb_l.position;
@@ -627,14 +881,28 @@ fn run_bilateral_loop(
         // mechanical stop. Runaway typically comes from assist-loop positive
         // feedback (low-friction DM leader) or a sign-convention mismatch
         // between leader and follower.
+        //
+        // Skip during soft-start: at launch the operator may have left a
+        // motor parked outside ±safety_radius (multi-turn position, no
+        // recent Zero Pair, etc.). The ramped torque during soft-start
+        // pulls the two motors toward each other so the leader naturally
+        // moves toward the safety zone within the ramp window. Only after
+        // ramp = 1.0 does an out-of-zone reading represent a genuine
+        // failure to track / runaway we should react to.
         if config.safety_radius > 0.0
+            && !in_softstart
             && (fb_l.position.abs() > config.safety_radius
                 || fb_f.position.abs() > config.safety_radius)
         {
             if let Ok(mut t) = telemetry.lock() {
                 t.last_error = Some(format!(
-                    "SAFETY: |pos| exceeded {:.2} rad (leader={:.3}, follower={:.3}) — disabling",
-                    config.safety_radius, fb_l.position, fb_f.position,
+                    "SAFETY: |pos| exceeded {:.2} rad after soft-start \
+                     (leader pos={:.3} v={:.3} τ={:.3}, follower pos={:.3} v={:.3} τ={:.3}) — \
+                     disabling. Tip: run 'Zero Pair' first, increase safety_rad, \
+                     or move motor closer to zero before starting.",
+                    config.safety_radius,
+                    fb_l.position, fb_l.velocity, fb_l.torque,
+                    fb_f.position, fb_f.velocity, fb_f.torque,
                 ));
             }
             break;
@@ -652,12 +920,17 @@ fn run_bilateral_loop(
             dob_follower.update(tau_follower_clamped, fb_f.velocity, dt);
         }
 
-        // Compute loop frequency
-        let elapsed = iter_start.elapsed().as_secs_f64();
-        if elapsed > 0.0 {
-            hz_accum += 1.0 / elapsed;
-            hz_count += 1;
+        // Compute loop frequency (actual loop period including sleep, not
+        // just work time). Skip the first cycle since prev_iter_start is
+        // None and the very first interval isn't representative anyway.
+        if let Some(prev) = prev_iter_start {
+            let cycle_secs = iter_start.duration_since(prev).as_secs_f64();
+            if cycle_secs > 0.0 {
+                hz_accum += 1.0 / cycle_secs;
+                hz_count += 1;
+            }
         }
+        prev_iter_start = Some(iter_start);
 
         // Update telemetry (not every cycle to reduce contention)
         if cycle % 10 == 0 {

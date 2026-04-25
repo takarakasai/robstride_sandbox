@@ -256,22 +256,38 @@ impl MotorDriver for RobstrideDriver {
         send_can(socket, can_id, &data)?;
 
         // Read response; skip echoes / unrelated motor frames.
+        //
+        // We validate three things on each candidate frame:
+        //   1. CommType == OperationStatus
+        //   2. The CAN ID's `dev` field equals our host_id — the motor
+        //      *targeted* its response at us. If the motor was previously
+        //      bound to a different host (e.g. another process on the bus)
+        //      its status frames may carry a foreign `dev` and we must
+        //      ignore them or we'll parse another conversation's bytes
+        //      as our own motor's state.
+        //   3. The status-frame's encoded `motor_id` (low byte of
+        //      extra_data) matches our `self.motor_id`.
         let deadline = Instant::now() + Duration::from_millis(10);
         loop {
             let timeout = deadline
                 .duration_since(Instant::now())
                 .max(Duration::from_millis(1));
             let (ct, extra, dev, rdata) = recv_can(socket, timeout)?;
-            if ct == CommType::OperationStatus as u8 {
-                let raw = build_can_id_raw(ct, extra, dev);
-                if let Some(mut fb) = parse_status_frame(raw, &rdata, &self.scales) {
-                    if fb.motor_id == self.motor_id {
-                        fb.position = sign * (fb.position - self.soft_zero);
-                        fb.velocity = sign * fb.velocity;
-                        fb.torque = sign * fb.torque;
-                        return Ok(fb);
-                    }
+            if ct != CommType::OperationStatus as u8 {
+                continue;
+            }
+            if dev != self.host_id {
+                continue;
+            }
+            let raw = build_can_id_raw(ct, extra, dev);
+            if let Some(mut fb) = parse_status_frame(raw, &rdata, &self.scales) {
+                if fb.motor_id != self.motor_id {
+                    continue;
                 }
+                fb.position = sign * (fb.position - self.soft_zero);
+                fb.velocity = sign * fb.velocity;
+                fb.torque = sign * fb.torque;
+                return Ok(fb);
             }
         }
     }
