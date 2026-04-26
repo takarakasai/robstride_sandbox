@@ -232,7 +232,7 @@ fn params_for_command(cmd: Command) -> Vec<ParamField> {
             ParamField::with_choices("foll_inv", "0", "Follower polarity flip (1 to invert sign)",
                 "0|1"),
             ParamField::with_choices("method", "coupling", "Control method",
-                "pos|force|coupling|mode|ondemand|ondemand_emu"),
+                "pos|force|coupling|mode|ondemand|ondemand_emu|coupling_mit"),
             ParamField::new("kp", "5.0", "Spring stiffness [Nm/rad]"),
             ParamField::new("kd", "0.3", "Damping [Nm·s/rad]"),
             ParamField::new("coulomb", "0.05", "Coulomb friction comp [Nm]"),
@@ -1528,7 +1528,7 @@ impl App {
             Some(m) => m,
             None => {
                 self.log_msg(format!(
-                    "Unknown method '{}'. Use: pos, force, coupling, mode, ondemand, ondemand_emu",
+                    "Unknown method '{}'. Use: pos, force, coupling, mode, ondemand, ondemand_emu, coupling_mit",
                     method_str
                 ));
                 return;
