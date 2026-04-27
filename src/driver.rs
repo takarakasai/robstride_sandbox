@@ -134,6 +134,61 @@ fn recv_can(socket: &CanSocket, timeout: Duration) -> Result<(u8, u16, u8, Vec<u
     }
 }
 
+/// Result of a passive sniff of the CAN bus.
+#[derive(Debug, Clone, Default)]
+pub struct BusSniffResult {
+    /// Total Robstride OperationStatus frames observed in the window.
+    pub status_frames: u32,
+    /// Set of distinct `host_id` values (the `dev` field of a status
+    /// frame) that the observed motors are addressing. If anyone other
+    /// than us is driving the bus, our host_id will appear here too
+    /// (because motors echo back to whoever asked) — so a non-empty set
+    /// that doesn't match the host_id we are about to use, or *contains*
+    /// our host_id while we have not yet transmitted, indicates an
+    /// already-running peer process on the same bus.
+    pub host_ids: std::collections::BTreeSet<u8>,
+    /// Set of distinct motor IDs (low byte of `extra_data` in status
+    /// frames) observed responding on the bus.
+    pub motor_ids: std::collections::BTreeSet<u8>,
+}
+
+/// Passively listen on the bus for `duration` without sending anything.
+///
+/// Used as a pre-flight check to detect another process (or another host)
+/// already driving the same bus. The expected steady-state behaviour with
+/// no commands issued is **zero** Robstride OperationStatus frames; any
+/// non-zero count means a peer is talking and our `mit_exchange`
+/// host-id filter cannot reliably disambiguate frame ownership.
+///
+/// This intentionally only counts Robstride extended-frame OperationStatus
+/// (CommType=2): standard 11-bit ID traffic from DAMIAO motors, generic
+/// CAN sensors, etc. is unrelated and would produce false positives.
+pub fn sniff_robstride_bus(socket: &CanSocket, duration: Duration) -> BusSniffResult {
+    let mut out = BusSniffResult::default();
+    let deadline = Instant::now() + duration;
+    while Instant::now() < deadline {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let slice = remaining.min(Duration::from_millis(20));
+        match recv_can(socket, slice) {
+            Ok((ct, extra, dev, _data)) => {
+                if ct == CommType::OperationStatus as u8 {
+                    out.status_frames += 1;
+                    out.host_ids.insert(dev);
+                    // For OperationStatus frames the low byte of
+                    // extra_data carries the responding motor's ID.
+                    out.motor_ids.insert((extra & 0xFF) as u8);
+                }
+            }
+            Err(RobstrideError::Timeout { .. }) => {
+                // Expected when the bus is quiet — keep listening.
+                continue;
+            }
+            Err(_) => continue,
+        }
+    }
+    out
+}
+
 // =============================================================================
 // Robstride driver
 // =============================================================================

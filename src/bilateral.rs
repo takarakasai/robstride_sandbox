@@ -447,6 +447,38 @@ fn run_bilateral_loop(
     let socket = CanSocket::open(&config.interface)?;
     socket.set_read_timeout(Duration::from_millis(10))?;
 
+    // Host-ID collision sniff. Before we transmit anything, listen for a
+    // brief window: any Robstride OperationStatus frames during that
+    // period mean a *peer* process is already driving the bus. SocketCAN
+    // doesn't reject our open in that case, but our `mit_exchange` cannot
+    // reliably tell apart the peer's responses from our own, so bilateral
+    // control will silently mis-interpret frames as feedback. Bail with a
+    // clear message instead.
+    //
+    // The lock file from `can_lock` catches same-host duplicates; this
+    // catches different hosts, foreign tools, or stuck child processes
+    // that for some reason did not take the lock.
+    {
+        use crate::driver::sniff_robstride_bus;
+        let sniff = sniff_robstride_bus(&socket, Duration::from_millis(200));
+        if sniff.status_frames > 0 {
+            let msg = format!(
+                "CAN bus '{}' is already being driven by another process: \
+                 saw {} Robstride status frame(s) in 200 ms (host_ids={:?}, \
+                 motor_ids={:?}). Refusing to start bilateral control to \
+                 avoid cross-talk. Stop the other process and retry.",
+                config.interface,
+                sniff.status_frames,
+                sniff.host_ids,
+                sniff.motor_ids,
+            );
+            if let Ok(mut t) = telemetry.lock() {
+                t.last_error = Some(msg.clone());
+            }
+            return Err(crate::error::RobstrideError::Other(msg));
+        }
+    }
+
     let mut leader = config.leader.build();
     let mut follower = config.follower.build();
 
