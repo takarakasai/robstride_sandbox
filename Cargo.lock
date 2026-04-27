@@ -801,6 +801,7 @@ dependencies = [
  "crossterm",
  "embedded-can",
  "env_logger",
+ "libc",
  "log",
  "ratatui",
  "serde",

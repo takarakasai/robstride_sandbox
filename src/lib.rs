@@ -26,6 +26,7 @@
 //! ```
 
 pub mod bilateral;
+pub mod can_lock;
 pub mod driver;
 pub mod error;
 pub mod motor;

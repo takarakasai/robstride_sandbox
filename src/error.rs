@@ -30,6 +30,12 @@ pub enum RobstrideError {
 
     #[error("Serial port error: {0}")]
     SerialPort(String),
+
+    /// Catch-all for misuse / setup errors that don't have a dedicated
+    /// variant (e.g. CAN interface lock conflicts, configuration sanity
+    /// failures). The message is the canonical surface — log it directly.
+    #[error("{0}")]
+    Other(String),
 }
 
 pub type Result<T> = std::result::Result<T, RobstrideError>;
