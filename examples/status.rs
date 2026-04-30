@@ -22,7 +22,7 @@ fn main() -> Result<()> {
         .unwrap_or(1);
 
     println!("Connecting to motor {} on {}", motor_id, interface);
-    let motor = Motor::new(&interface, motor_id, 0xFF, MotorModel::Rs05)?;
+    let motor = Motor::new(&interface, motor_id, 0xFF, MotorModel::Rs05, false)?;
 
     // Read status via MIT zero-command
     match motor.read_status() {

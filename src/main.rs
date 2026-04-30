@@ -11,7 +11,7 @@ use robstride_sandbox::protocol::{
     parse_can_id, MotorFeedback, MotorModel, ParamIndex, RunMode, DEFAULT_HOST_ID,
 };
 use robstride_sandbox::serial_can::SerialCan;
-use socketcan::{CanSocket, EmbeddedFrame, Id, Socket};
+use robstride_sandbox::transport::CanBus;
 use std::time::{Duration, Instant};
 
 const DEFAULT_DM_MODEL: DamiaoModel = DamiaoModel::DmJ4310_2EC;
@@ -58,6 +58,10 @@ struct Cli {
     /// Host CAN ID for Robstride commands
     #[arg(long, default_value_t = DEFAULT_HOST_ID)]
     host_id: u8,
+
+    /// Use CAN FD framing (BRS on) for all bus traffic instead of Classic CAN
+    #[arg(long, default_value_t = false)]
+    fd: bool,
 
     /// Motor vendor (`auto` infers from `--model`, `both` is scan-only)
     #[arg(long, value_enum, default_value_t = Vendor::Auto)]
@@ -225,7 +229,7 @@ fn main() -> Result<()> {
             return Ok(());
         }
         Commands::Dump { duration } => {
-            run_dump(&cli.interface, *duration)?;
+            run_dump(&cli.interface, *duration, cli.fd)?;
             return Ok(());
         }
         Commands::SerialScan {
@@ -302,7 +306,7 @@ fn run_scan(cli: &Cli, from: u8, to: u8, timeout_ms: u64) -> Result<()> {
             "Scanning Robstride motors on '{}' (ID {}..={}, timeout {}ms/id, host=0x{:02X})...",
             cli.interface, from, to, timeout_ms, cli.host_id
         );
-        let results = Motor::scan_bus(&cli.interface, cli.host_id, from..=to, timeout);
+        let results = Motor::scan_bus(&cli.interface, cli.host_id, from..=to, timeout, cli.fd);
         if results.is_empty() {
             println!("  No Robstride motors found.");
         } else {
@@ -325,7 +329,7 @@ fn run_scan(cli: &Cli, from: u8, to: u8, timeout_ms: u64) -> Result<()> {
             "Scanning DAMIAO motors on '{}' (ID {}..={}, timeout {}ms/id)...",
             cli.interface, from, to, timeout_ms
         );
-        let ids = driver::scan_damiao(&cli.interface, from..=to, timeout)?;
+        let ids = driver::scan_damiao(&cli.interface, from..=to, timeout, cli.fd)?;
         if ids.is_empty() {
             println!("  No DAMIAO motors found.");
         } else {
@@ -350,13 +354,13 @@ fn run_scan(cli: &Cli, from: u8, to: u8, timeout_ms: u64) -> Result<()> {
     Ok(())
 }
 
-fn run_dump(interface: &str, duration_secs: f32) -> Result<()> {
+fn run_dump(interface: &str, duration_secs: f32, fd: bool) -> Result<()> {
     println!(
         "Listening on '{}' for {:.1}s (passive, no frames sent)...",
         interface, duration_secs
     );
 
-    let socket = CanSocket::open(interface)?;
+    let socket = CanBus::open(interface, fd)?;
     socket.set_read_timeout(Duration::from_millis(100))?;
     let deadline = Instant::now() + Duration::from_secs_f32(duration_secs);
     let mut frames = Vec::new();
@@ -364,11 +368,7 @@ fn run_dump(interface: &str, duration_secs: f32) -> Result<()> {
     while Instant::now() < deadline {
         match socket.read_frame() {
             Ok(frame) => {
-                let raw_id = match frame.id() {
-                    Id::Standard(sid) => sid.as_raw() as u32,
-                    Id::Extended(eid) => eid.as_raw(),
-                };
-                frames.push((frame.is_extended(), raw_id, frame.data().to_vec()));
+                frames.push((frame.extended, frame.raw_id, frame.data));
             }
             Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
             Err(e) => return Err(e.into()),
@@ -453,7 +453,7 @@ fn run_serial_scan(
 }
 
 fn run_robstride_command(cli: &Cli, model: MotorModel, command: &Commands) -> Result<()> {
-    let mut motor = Motor::new(&cli.interface, cli.motor_id, cli.host_id, model)?;
+    let mut motor = Motor::new(&cli.interface, cli.motor_id, cli.host_id, model, cli.fd)?;
 
     match command {
         Commands::Ping => match motor.ping() {
@@ -612,16 +612,16 @@ fn run_damiao_command(cli: &Cli, model: DamiaoModel, command: &Commands) -> Resu
 
     match command {
         Commands::Ping => {
-            let fb = damiao_feedback_once(&cli.interface, &spec)?;
+            let fb = damiao_feedback_once(&cli.interface, &spec, cli.fd)?;
             println!("Motor responded.");
             print_feedback(&fb);
         }
         Commands::Status => {
-            let fb = damiao_feedback_once(&cli.interface, &spec)?;
+            let fb = damiao_feedback_once(&cli.interface, &spec, cli.fd)?;
             print_feedback(&fb);
         }
         Commands::Enable => {
-            let socket = open_can_socket(&cli.interface)?;
+            let socket = open_can_socket(&cli.interface, cli.fd)?;
             let mut driver = spec.build();
             driver.enable(&socket)?;
             println!("Motor enabled.");
@@ -629,24 +629,24 @@ fn run_damiao_command(cli: &Cli, model: DamiaoModel, command: &Commands) -> Resu
             print_feedback(&fb);
         }
         Commands::Disable => {
-            let socket = open_can_socket(&cli.interface)?;
+            let socket = open_can_socket(&cli.interface, cli.fd)?;
             let mut driver = spec.build();
             driver.disable(&socket)?;
             println!("Motor disabled.");
         }
         Commands::SetZero => {
-            let socket = open_can_socket(&cli.interface)?;
+            let socket = open_can_socket(&cli.interface, cli.fd)?;
             driver::damiao_set_zero_nvm(&socket, cli.motor_id)?;
             println!("DAMIAO hardware zero saved to NVM.");
         }
         Commands::MoveTo { position, speed } => {
-            run_damiao_move_to(&cli.interface, &spec, *position as f64, *speed as f64)?;
+            run_damiao_move_to(&cli.interface, &spec, *position as f64, *speed as f64, cli.fd)?;
         }
         Commands::Spin { velocity, duration } => {
-            run_damiao_spin(&cli.interface, &spec, *velocity as f64, *duration)?;
+            run_damiao_spin(&cli.interface, &spec, *velocity as f64, *duration, cli.fd)?;
         }
         Commands::Torque { torque, duration } => {
-            run_damiao_torque(&cli.interface, &spec, *torque as f64, *duration)?;
+            run_damiao_torque(&cli.interface, &spec, *torque as f64, *duration, cli.fd)?;
         }
         Commands::Mit {
             pos,
@@ -655,7 +655,7 @@ fn run_damiao_command(cli: &Cli, model: DamiaoModel, command: &Commands) -> Resu
             kd,
             torque,
         } => {
-            let socket = open_can_socket(&cli.interface)?;
+            let socket = open_can_socket(&cli.interface, cli.fd)?;
             let mut driver = spec.build();
             driver.enable(&socket)?;
             let fb = driver.mit_exchange(&socket, *pos, *vel, *kp, *kd, *torque)?;
@@ -663,7 +663,7 @@ fn run_damiao_command(cli: &Cli, model: DamiaoModel, command: &Commands) -> Resu
             print_feedback(&fb);
         }
         Commands::ReadParam { name } => {
-            run_damiao_read_param(&cli.interface, &spec, name)?;
+            run_damiao_read_param(&cli.interface, &spec, name, cli.fd)?;
         }
         Commands::WriteParam { name, .. } => {
             bail!(
@@ -672,7 +672,7 @@ fn run_damiao_command(cli: &Cli, model: DamiaoModel, command: &Commands) -> Resu
             );
         }
         Commands::Monitor { interval } => {
-            run_damiao_monitor(&cli.interface, &spec, *interval)?;
+            run_damiao_monitor(&cli.interface, &spec, *interval, cli.fd)?;
         }
         Commands::Scan { .. }
         | Commands::Dump { .. }
@@ -683,14 +683,14 @@ fn run_damiao_command(cli: &Cli, model: DamiaoModel, command: &Commands) -> Resu
     Ok(())
 }
 
-fn open_can_socket(interface: &str) -> Result<CanSocket> {
-    let socket = CanSocket::open(interface)?;
+fn open_can_socket(interface: &str, fd: bool) -> Result<CanBus> {
+    let socket = CanBus::open(interface, fd)?;
     socket.set_read_timeout(Duration::from_millis(100))?;
     Ok(socket)
 }
 
-fn damiao_feedback_once(interface: &str, spec: &MotorSpec) -> Result<MotorFeedback> {
-    let socket = open_can_socket(interface)?;
+fn damiao_feedback_once(interface: &str, spec: &MotorSpec, fd: bool) -> Result<MotorFeedback> {
+    let socket = open_can_socket(interface, fd)?;
     let mut driver = spec.build();
     driver.enable(&socket)?;
     let feedback = driver.mit_exchange(&socket, 0.0, 0.0, 0.0, 0.0, 0.0)?;
@@ -698,8 +698,8 @@ fn damiao_feedback_once(interface: &str, spec: &MotorSpec) -> Result<MotorFeedba
     Ok(feedback)
 }
 
-fn run_damiao_move_to(interface: &str, spec: &MotorSpec, position: f64, speed: f64) -> Result<()> {
-    let socket = open_can_socket(interface)?;
+fn run_damiao_move_to(interface: &str, spec: &MotorSpec, position: f64, speed: f64, fd: bool) -> Result<()> {
+    let socket = open_can_socket(interface, fd)?;
     let mut driver = spec.build();
     let speed = speed.abs();
 
@@ -738,8 +738,8 @@ fn run_damiao_move_to(interface: &str, spec: &MotorSpec, position: f64, speed: f
     Ok(())
 }
 
-fn run_damiao_spin(interface: &str, spec: &MotorSpec, velocity: f64, duration: f32) -> Result<()> {
-    let socket = open_can_socket(interface)?;
+fn run_damiao_spin(interface: &str, spec: &MotorSpec, velocity: f64, duration: f32, fd: bool) -> Result<()> {
+    let socket = open_can_socket(interface, fd)?;
     let mut driver = spec.build();
     let deadline = duration_deadline(duration);
 
@@ -771,8 +771,8 @@ fn run_damiao_spin(interface: &str, spec: &MotorSpec, velocity: f64, duration: f
     Ok(())
 }
 
-fn run_damiao_torque(interface: &str, spec: &MotorSpec, torque: f64, duration: f32) -> Result<()> {
-    let socket = open_can_socket(interface)?;
+fn run_damiao_torque(interface: &str, spec: &MotorSpec, torque: f64, duration: f32, fd: bool) -> Result<()> {
+    let socket = open_can_socket(interface, fd)?;
     let mut driver = spec.build();
     let deadline = duration_deadline(duration);
 
@@ -804,8 +804,8 @@ fn run_damiao_torque(interface: &str, spec: &MotorSpec, torque: f64, duration: f
     Ok(())
 }
 
-fn run_damiao_monitor(interface: &str, spec: &MotorSpec, interval_ms: u64) -> Result<()> {
-    let socket = open_can_socket(interface)?;
+fn run_damiao_monitor(interface: &str, spec: &MotorSpec, interval_ms: u64, fd: bool) -> Result<()> {
+    let socket = open_can_socket(interface, fd)?;
     let mut driver = spec.build();
 
     driver.enable(&socket)?;
@@ -826,15 +826,15 @@ fn run_damiao_monitor(interface: &str, spec: &MotorSpec, interval_ms: u64) -> Re
     }
 }
 
-fn run_damiao_read_param(interface: &str, spec: &MotorSpec, name: &str) -> Result<()> {
+fn run_damiao_read_param(interface: &str, spec: &MotorSpec, name: &str, fd: bool) -> Result<()> {
     match name.to_lowercase().as_str() {
         "mech_pos" | "position" => {
-            let fb = damiao_feedback_once(interface, spec)?;
+            let fb = damiao_feedback_once(interface, spec, fd)?;
             println!("{} = {:.4}", name, fb.position);
             Ok(())
         }
         "mech_vel" | "velocity" => {
-            let fb = damiao_feedback_once(interface, spec)?;
+            let fb = damiao_feedback_once(interface, spec, fd)?;
             println!("{} = {:.4}", name, fb.velocity);
             Ok(())
         }

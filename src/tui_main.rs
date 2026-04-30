@@ -18,7 +18,7 @@ use serde::{Deserialize, Serialize};
 
 use robstride_sandbox::bilateral::{self, AssistTestConfig, BilateralConfig, BilateralGains, BilateralMethod, SharedTelemetry, StopFlag};
 use robstride_sandbox::driver::{self, DamiaoModel, MotorSpec};
-use socketcan::{CanSocket, Socket};
+use robstride_sandbox::transport::CanBus;
 use robstride_sandbox::motor::Motor;
 use robstride_sandbox::protocol::{MotorFeedback, MotorModel, ParamIndex, RunMode};
 
@@ -69,12 +69,17 @@ const APP_NAME: &str = "robstride_sandbox";
 struct AppConfig {
     /// { "Bilateral" => { "kp" => "5.0", "kd" => "0.3", ... }, ... }
     params: HashMap<String, HashMap<String, String>>,
+    /// Persisted CAN FD selection. `true` = CAN FD, `false` = Classic CAN.
+    /// `#[serde(default)]` keeps old config files (without this key) loadable.
+    #[serde(default)]
+    use_fd: bool,
 }
 
 impl Default for AppConfig {
     fn default() -> Self {
         AppConfig {
             params: HashMap::new(),
+            use_fd: false,
         }
     }
 }
@@ -348,6 +353,8 @@ impl Command {
 struct App {
     /// CAN interface name
     interface: String,
+    /// Whether all bus traffic uses CAN FD framing (toggled with 'f').
+    use_fd: bool,
     /// Default host ID
     host_id: u8,
     /// Default motor model
@@ -408,6 +415,7 @@ struct App {
 impl App {
     fn new(interface: &str, host_id: u8, model: MotorModel) -> Self {
         let config = AppConfig::load();
+        let use_fd = config.use_fd;
         let initial_cmd = Command::ALL[0];
         let params = Self::apply_config_to_params(
             params_for_command(initial_cmd),
@@ -416,6 +424,7 @@ impl App {
         );
         App {
             interface: interface.to_string(),
+            use_fd,
             host_id,
             default_model: model,
             motors: Vec::new(),
@@ -500,6 +509,23 @@ impl App {
         // scan is short (~10ms per ID, ~1 s for 1..127) so it runs inline
         // after the async scan completes (via self.dm_scan_after).
         if do_rs {
+            // Validate the interface opens *before* spawning the scan thread.
+            // The background scanner returns silently on an open failure, which
+            // looks like "the scan finished instantly and did nothing" — most
+            // often a CAN FD interface mismatch. Surfacing the error here gives
+            // the operator a clear, actionable message instead.
+            if let Err(e) = CanBus::open(&self.interface, self.use_fd) {
+                let hint = if self.use_fd {
+                    "  (CAN FD selected — bring the interface up with 'fd on'/dbitrate, or press 'f' for Classic CAN.)"
+                } else {
+                    ""
+                };
+                self.log_msg(format!(
+                    "Cannot open '{}' for scan: {}{}",
+                    self.interface, e, hint
+                ));
+                return;
+            }
             self.log_msg(format!(
                 "Scanning CAN bus (Robstride) ID {}..={}...",
                 from, to
@@ -514,6 +540,7 @@ impl App {
             }
             let interface = self.interface.clone();
             let host_id = self.host_id;
+            let use_fd = self.use_fd;
             let progress = Arc::clone(&self.scan_progress);
             let results_out = Arc::clone(&self.scan_results);
             std::thread::spawn(move || {
@@ -522,6 +549,7 @@ impl App {
                     host_id,
                     from..=to,
                     Duration::from_millis(100),
+                    use_fd,
                     |current, total, _motor_id| {
                         if let Ok(mut p) = progress.lock() {
                             p.0 = current;
@@ -551,7 +579,7 @@ impl App {
             "Scanning CAN bus (DAMIAO) ID {}..={} (probe takes ~10 ms/ID)...",
             from, to
         ));
-        match driver::scan_damiao(&self.interface, from..=to, Duration::from_millis(10)) {
+        match driver::scan_damiao(&self.interface, from..=to, Duration::from_millis(10), self.use_fd) {
             Ok(ids) => {
                 if ids.is_empty() {
                     self.log_msg("No DAMIAO motors found.".to_string());
@@ -589,9 +617,14 @@ impl App {
 
     /// Check if a background scan has completed and process results.
     fn check_scan_complete(&mut self) {
+        // A scan is "done" once the worker has cleared the active flag and a
+        // total was set (progress.1 > 0). We intentionally do NOT require
+        // progress.0 > 0: a scan that finished without advancing (e.g. the
+        // worker's socket open failed) must still be processed and reset, or
+        // the UI would silently swallow the result and never report it.
         let done = {
             let progress = self.scan_progress.lock().unwrap();
-            !progress.2 && progress.0 > 0 && progress.0 == progress.1
+            !progress.2 && progress.1 > 0
         };
         if !done {
             return;
@@ -672,7 +705,7 @@ impl App {
                 can_id,
                 model,
                 ..
-            } => match Motor::new(&self.interface, can_id, host_id, model) {
+            } => match Motor::new(&self.interface, can_id, host_id, model, self.use_fd) {
                 Ok(motor) => match motor.ping() {
                     Ok((device_id, uuid)) => {
                         self.log_msg(format!(
@@ -688,7 +721,7 @@ impl App {
                 Err(e) => self.log_msg(format!("CAN open error: {}", e)),
             },
             MotorSpec::Damiao { .. } => {
-                let socket = match CanSocket::open(&self.interface) {
+                let socket = match CanBus::open(&self.interface, self.use_fd) {
                     Ok(s) => s,
                     Err(e) => {
                         self.log_msg(format!("CAN open error: {}", e));
@@ -730,7 +763,7 @@ impl App {
         let idx = self.selected_motor;
         let spec = self.motors[idx].spec.clone();
         let label = spec.description();
-        let socket = match CanSocket::open(&self.interface) {
+        let socket = match CanBus::open(&self.interface, self.use_fd) {
             Ok(s) => s,
             Err(e) => {
                 self.log_msg(format!("CAN open error: {}", e));
@@ -762,7 +795,7 @@ impl App {
         let idx = self.selected_motor;
         let spec = self.motors[idx].spec.clone();
         let label = spec.description();
-        let socket = match CanSocket::open(&self.interface) {
+        let socket = match CanBus::open(&self.interface, self.use_fd) {
             Ok(s) => s,
             Err(e) => {
                 self.log_msg(format!("CAN open error: {}", e));
@@ -808,13 +841,13 @@ impl App {
                 can_id,
                 model,
                 ..
-            } => match Motor::new(&self.interface, *can_id, *host_id, *model) {
+            } => match Motor::new(&self.interface, *can_id, *host_id, *model, self.use_fd) {
                 Ok(mut motor) => motor
                     .set_zero()
                     .map_err(|e| format!("Set zero failed: {}", e)),
                 Err(e) => Err(format!("CAN open error: {}", e)),
             },
-            MotorSpec::Damiao { can_id, .. } => match CanSocket::open(&self.interface) {
+            MotorSpec::Damiao { can_id, .. } => match CanBus::open(&self.interface, self.use_fd) {
                 Ok(socket) => {
                     let _ = socket.set_read_timeout(Duration::from_millis(50));
                     driver::damiao_set_zero_nvm(&socket, *can_id)
@@ -850,7 +883,7 @@ impl App {
         let idx = self.selected_motor;
         let spec = self.motors[idx].spec.clone();
         let was_enabled = self.motors[idx].enabled;
-        let socket = match CanSocket::open(&self.interface) {
+        let socket = match CanBus::open(&self.interface, self.use_fd) {
             Ok(s) => s,
             Err(e) => {
                 self.log_msg(format!("CAN open error: {}", e));
@@ -912,7 +945,7 @@ impl App {
                 can_id,
                 model,
                 ..
-            } => match Motor::new(&self.interface, can_id, host_id, model) {
+            } => match Motor::new(&self.interface, can_id, host_id, model, self.use_fd) {
                 Ok(motor) => match motor.read_param(param) {
                     Ok(val) => self.log_msg(format!("{} = {:.4}", input.trim(), val)),
                     Err(e) => self.log_msg(format!("Read param failed: {}", e)),
@@ -920,7 +953,7 @@ impl App {
                 Err(e) => self.log_msg(format!("CAN open error: {}", e)),
             },
             MotorSpec::Damiao { .. } => {
-                let socket = match CanSocket::open(&self.interface) {
+                let socket = match CanBus::open(&self.interface, self.use_fd) {
                     Ok(s) => s,
                     Err(e) => {
                         self.log_msg(format!("CAN open error: {}", e));
@@ -996,7 +1029,7 @@ impl App {
                 can_id,
                 model,
                 ..
-            } => match Motor::new(&self.interface, can_id, host_id, model) {
+            } => match Motor::new(&self.interface, can_id, host_id, model, self.use_fd) {
                 Ok(motor) => match motor.write_param_f32(param, value) {
                     Ok(()) => self.log_msg(format!("{} = {:.4} (written)", parts[0], value)),
                     Err(e) => self.log_msg(format!("Write param failed: {}", e)),
@@ -1036,7 +1069,7 @@ impl App {
                 can_id,
                 model,
                 ..
-            } => match Motor::new(&self.interface, can_id, host_id, model) {
+            } => match Motor::new(&self.interface, can_id, host_id, model, self.use_fd) {
                 Ok(mut motor) => match motor.set_run_mode(mode) {
                     Ok(()) => self.log_msg(format!("Run mode set to {:?}", mode)),
                     Err(e) => self.log_msg(format!("Set run mode failed: {}", e)),
@@ -1085,7 +1118,7 @@ impl App {
                 can_id,
                 model,
                 ..
-            } => match Motor::new(&self.interface, can_id, host_id, model) {
+            } => match Motor::new(&self.interface, can_id, host_id, model, self.use_fd) {
                 Ok(mut motor) => {
                     let r = (|| -> std::result::Result<(), robstride_sandbox::error::RobstrideError> {
                         motor.disable()?;
@@ -1107,7 +1140,7 @@ impl App {
                 Err(e) => self.log_msg(format!("CAN open error: {}", e)),
             },
             MotorSpec::Damiao { .. } => {
-                let socket = match CanSocket::open(&self.interface) {
+                let socket = match CanBus::open(&self.interface, self.use_fd) {
                     Ok(s) => s,
                     Err(e) => {
                         self.log_msg(format!("CAN open error: {}", e));
@@ -1159,7 +1192,7 @@ impl App {
                 can_id,
                 model,
                 ..
-            } => match Motor::new(&self.interface, can_id, host_id, model) {
+            } => match Motor::new(&self.interface, can_id, host_id, model, self.use_fd) {
                 Ok(mut motor) => {
                     let r = (|| -> std::result::Result<(), robstride_sandbox::error::RobstrideError> {
                         motor.disable()?;
@@ -1180,7 +1213,7 @@ impl App {
                 Err(e) => self.log_msg(format!("CAN open error: {}", e)),
             },
             MotorSpec::Damiao { .. } => {
-                let socket = match CanSocket::open(&self.interface) {
+                let socket = match CanBus::open(&self.interface, self.use_fd) {
                     Ok(s) => s,
                     Err(e) => {
                         self.log_msg(format!("CAN open error: {}", e));
@@ -1229,7 +1262,7 @@ impl App {
                 can_id,
                 model,
                 ..
-            } => match Motor::new(&self.interface, can_id, host_id, model) {
+            } => match Motor::new(&self.interface, can_id, host_id, model, self.use_fd) {
                 Ok(mut motor) => {
                     let r = (|| -> std::result::Result<(), robstride_sandbox::error::RobstrideError> {
                         motor.disable()?;
@@ -1250,7 +1283,7 @@ impl App {
                 Err(e) => self.log_msg(format!("CAN open error: {}", e)),
             },
             MotorSpec::Damiao { .. } => {
-                let socket = match CanSocket::open(&self.interface) {
+                let socket = match CanBus::open(&self.interface, self.use_fd) {
                     Ok(s) => s,
                     Err(e) => {
                         self.log_msg(format!("CAN open error: {}", e));
@@ -1301,7 +1334,7 @@ impl App {
                 can_id,
                 model,
                 ..
-            } => match Motor::new(&self.interface, can_id, host_id, model) {
+            } => match Motor::new(&self.interface, can_id, host_id, model, self.use_fd) {
                 Ok(mut motor) => {
                     let r =
                         (|| -> std::result::Result<MotorFeedback, robstride_sandbox::error::RobstrideError> {
@@ -1327,7 +1360,7 @@ impl App {
                 Err(e) => self.log_msg(format!("CAN open error: {}", e)),
             },
             MotorSpec::Damiao { .. } => {
-                let socket = match CanSocket::open(&self.interface) {
+                let socket = match CanBus::open(&self.interface, self.use_fd) {
                     Ok(s) => s,
                     Err(e) => {
                         self.log_msg(format!("CAN open error: {}", e));
@@ -1384,6 +1417,7 @@ impl App {
         let motor = self.apply_saved_offset(motor);
         let mut cfg = AssistTestConfig {
             interface: self.interface.clone(),
+            use_fd: self.use_fd,
             motor,
             ..Default::default()
         };
@@ -1446,7 +1480,7 @@ impl App {
         );
         if let Some(w) = fw { self.log_msg(format!("Follower: {}", w)); }
 
-        let socket = match CanSocket::open(&self.interface) {
+        let socket = match CanBus::open(&self.interface, self.use_fd) {
             Ok(s) => s,
             Err(e) => {
                 self.log_msg(format!("CAN open error: {}", e));
@@ -1565,6 +1599,7 @@ impl App {
 
         let config = BilateralConfig {
             interface: self.interface.clone(),
+            use_fd: self.use_fd,
             leader,
             follower,
             method,
@@ -1645,7 +1680,7 @@ impl App {
     /// (DM MIT mode doesn't respond while disabled).
     fn refresh_motor_status(&mut self) {
         // Open one CanSocket and reuse for all enabled motors this tick.
-        let socket = match CanSocket::open(&self.interface) {
+        let socket = match CanBus::open(&self.interface, self.use_fd) {
             Ok(s) => s,
             Err(_) => return,
         };
@@ -1743,6 +1778,24 @@ impl App {
         // Esc stops bilateral control if running (outside editing)
         if key.code == KeyCode::Esc && !self.editing_param && !self.input_mode && self.bilateral_active() {
             self.stop_bilateral();
+            return;
+        }
+
+        // 'f' toggles CAN <-> CAN FD for all subsequent bus traffic.
+        // Disallowed mid-bilateral so the running loop's transport can't be
+        // changed out from under it.
+        if key.code == KeyCode::Char('f') && !self.editing_param && !self.input_mode {
+            if self.bilateral_active() {
+                self.log_msg("Cannot switch CAN/CANFD while a control loop is running.".to_string());
+                return;
+            }
+            self.use_fd = !self.use_fd;
+            self.config.use_fd = self.use_fd;
+            self.config.save();
+            self.log_msg(format!(
+                "Bus mode -> {} (saved)",
+                if self.use_fd { "CAN FD" } else { "Classic CAN" }
+            ));
             return;
         }
 
@@ -2089,12 +2142,37 @@ fn render_motors(frame: &mut Frame, app: &App, area: Rect) {
         Style::default().fg(Color::White)
     };
 
+    // Bus-mode badge: distinct background colour so CAN vs CAN FD is obvious
+    // at a glance regardless of which panel currently has focus.
+    let (mode_label, mode_style) = if app.use_fd {
+        (
+            " CAN FD ",
+            Style::default()
+                .fg(Color::White)
+                .bg(Color::Magenta)
+                .add_modifier(Modifier::BOLD),
+        )
+    } else {
+        (
+            " CAN ",
+            Style::default()
+                .fg(Color::White)
+                .bg(Color::Blue)
+                .add_modifier(Modifier::BOLD),
+        )
+    };
+    let motors_title = Line::from(vec![
+        Span::raw(format!(" Motors [{}] ", app.interface)),
+        Span::styled(mode_label, mode_style),
+        Span::styled(" (f: toggle) ", Style::default().fg(Color::Gray)),
+    ]);
+
     let table = Table::new(rows, widths)
         .header(header)
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .title(" Motors ")
+                .title(motors_title)
                 .border_style(border_style),
         )
         .row_highlight_style(Style::default().bg(Color::DarkGray));
@@ -2583,6 +2661,7 @@ fn main() -> Result<()> {
                 eprintln!("  Up/Down    Navigate list");
                 eprintln!("  Enter      Execute command / Read status");
                 eprintln!("  Esc        Cancel input");
+                eprintln!("  f          Toggle CAN / CAN FD (persisted)");
                 eprintln!("  q / Ctrl-C Quit");
                 std::process::exit(0);
             }
@@ -2652,7 +2731,7 @@ fn main() -> Result<()> {
                 app.stop_bilateral();
             }
             // Disable all enabled motors before quitting (vendor-agnostic).
-            if let Ok(socket) = CanSocket::open(&app.interface) {
+            if let Ok(socket) = CanBus::open(&app.interface, app.use_fd) {
                 let _ = socket.set_read_timeout(Duration::from_millis(50));
                 for entry in &app.motors {
                     if entry.enabled {

@@ -25,7 +25,7 @@ fn main() -> Result<()> {
         .unwrap_or(1);
 
     println!("=== Position Control Example ===");
-    let mut motor = Motor::new(&interface, motor_id, 0xFF, MotorModel::Rs05)?;
+    let mut motor = Motor::new(&interface, motor_id, 0xFF, MotorModel::Rs05, false)?;
 
     // Configure position mode
     motor.disable()?;

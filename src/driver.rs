@@ -11,10 +11,9 @@
 
 use std::time::{Duration, Instant};
 
-use socketcan::{CanSocket, EmbeddedFrame, ExtendedId, Id, Socket, StandardId};
-
 use crate::error::{Result, RobstrideError};
 use crate::protocol::*;
+use crate::transport::CanBus;
 
 /// Common motor feedback returned by every driver.
 ///
@@ -33,10 +32,10 @@ pub type Feedback = MotorFeedback;
 /// read by [`MotorDriver::mit_exchange`].
 pub trait MotorDriver: Send {
     /// Enable the motor (allow torque output).
-    fn enable(&mut self, socket: &CanSocket) -> Result<()>;
+    fn enable(&mut self, socket: &CanBus) -> Result<()>;
 
     /// Disable the motor (free-spin / zero output).
-    fn disable(&mut self, socket: &CanSocket) -> Result<()>;
+    fn disable(&mut self, socket: &CanBus) -> Result<()>;
 
     /// Latch the current physical position as the in-memory zero reference.
     ///
@@ -45,7 +44,7 @@ pub trait MotorDriver: Send {
     /// restart. The motor is briefly enabled and immediately disabled to
     /// read its current position (all MIT gains kept at zero so no torque
     /// is commanded).
-    fn set_soft_zero(&mut self, socket: &CanSocket) -> Result<()>;
+    fn set_soft_zero(&mut self, socket: &CanBus) -> Result<()>;
 
     /// Current soft-zero offset [rad].
     fn soft_zero_offset(&self) -> f64;
@@ -71,7 +70,7 @@ pub trait MotorDriver: Send {
     /// invoked).
     fn mit_exchange(
         &mut self,
-        socket: &CanSocket,
+        socket: &CanBus,
         position: f64,
         velocity: f64,
         kp: f64,
@@ -82,12 +81,12 @@ pub trait MotorDriver: Send {
     /// Read mechanical position [rad]. Must work while the motor is disabled
     /// (used by the OnDemand bilateral method to keep the leader free).
     /// The returned value is already soft-zero-adjusted.
-    fn read_position(&mut self, socket: &CanSocket) -> Result<f64>;
+    fn read_position(&mut self, socket: &CanBus) -> Result<f64>;
 
     /// Read mechanical velocity [rad/s]. Same disabled-read requirement as
     /// [`MotorDriver::read_position`]. Velocity is unaffected by the soft
     /// zero (it's a derivative quantity).
-    fn read_velocity(&mut self, socket: &CanSocket) -> Result<f64>;
+    fn read_velocity(&mut self, socket: &CanBus) -> Result<f64>;
 
     /// Safe output torque limit [Nm] used by the bilateral loop for clamping.
     /// Implementations should already include any safety margin they want
@@ -102,14 +101,12 @@ pub trait MotorDriver: Send {
 // Low-level CAN helpers (Robstride extended-ID framing)
 // =============================================================================
 
-fn send_can(socket: &CanSocket, can_id: u32, data: &[u8]) -> Result<()> {
-    let ext_id = ExtendedId::new(can_id).expect("Invalid extended CAN ID");
-    let frame = socketcan::CanFrame::new(ext_id, data).expect("Failed to create CAN frame");
-    socket.write_frame(&frame)?;
+fn send_can(socket: &CanBus, can_id: u32, data: &[u8]) -> Result<()> {
+    socket.write_extended(can_id, data)?;
     Ok(())
 }
 
-fn recv_can(socket: &CanSocket, timeout: Duration) -> Result<(u8, u16, u8, Vec<u8>)> {
+fn recv_can(socket: &CanBus, timeout: Duration) -> Result<(u8, u16, u8, Vec<u8>)> {
     let start = Instant::now();
     loop {
         if start.elapsed() > timeout {
@@ -117,16 +114,11 @@ fn recv_can(socket: &CanSocket, timeout: Duration) -> Result<(u8, u16, u8, Vec<u
         }
         match socket.read_frame() {
             Ok(frame) => {
-                if !frame.is_extended() {
+                if !frame.extended {
                     continue;
                 }
-                let raw_id = match frame.id() {
-                    Id::Standard(sid) => socketcan::StandardId::as_raw(&sid) as u32,
-                    Id::Extended(eid) => ExtendedId::as_raw(&eid),
-                };
-                let data = frame.data().to_vec();
-                let (comm_type, extra_data, device_id) = parse_can_id(raw_id);
-                return Ok((comm_type, extra_data, device_id, data));
+                let (comm_type, extra_data, device_id) = parse_can_id(frame.raw_id);
+                return Ok((comm_type, extra_data, device_id, frame.data));
             }
             Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
             Err(e) => return Err(RobstrideError::CanSocket(e)),
@@ -163,7 +155,7 @@ pub struct BusSniffResult {
 /// This intentionally only counts Robstride extended-frame OperationStatus
 /// (CommType=2): standard 11-bit ID traffic from DAMIAO motors, generic
 /// CAN sensors, etc. is unrelated and would produce false positives.
-pub fn sniff_robstride_bus(socket: &CanSocket, duration: Duration) -> BusSniffResult {
+pub fn sniff_robstride_bus(socket: &CanBus, duration: Duration) -> BusSniffResult {
     let mut out = BusSniffResult::default();
     let deadline = Instant::now() + duration;
     while Instant::now() < deadline {
@@ -231,7 +223,7 @@ impl RobstrideDriver {
         self.model
     }
 
-    fn read_param(&mut self, socket: &CanSocket, param: ParamIndex) -> Result<f32> {
+    fn read_param(&mut self, socket: &CanBus, param: ParamIndex) -> Result<f32> {
         let (can_id, data) = build_read_param_frame(self.host_id, self.motor_id, param);
         send_can(socket, can_id, &data)?;
         let deadline = Instant::now() + Duration::from_millis(20);
@@ -248,7 +240,7 @@ impl RobstrideDriver {
 }
 
 impl MotorDriver for RobstrideDriver {
-    fn enable(&mut self, socket: &CanSocket) -> Result<()> {
+    fn enable(&mut self, socket: &CanBus) -> Result<()> {
         let (can_id, data) = build_enable_frame(self.host_id, self.motor_id);
         send_can(socket, can_id, &data)?;
         // Consume the response frame if it arrives; ignore timeout.
@@ -256,14 +248,14 @@ impl MotorDriver for RobstrideDriver {
         Ok(())
     }
 
-    fn disable(&mut self, socket: &CanSocket) -> Result<()> {
+    fn disable(&mut self, socket: &CanBus) -> Result<()> {
         let (can_id, data) = build_disable_frame(self.host_id, self.motor_id);
         send_can(socket, can_id, &data)?;
         let _ = recv_can(socket, Duration::from_millis(50));
         Ok(())
     }
 
-    fn set_soft_zero(&mut self, socket: &CanSocket) -> Result<()> {
+    fn set_soft_zero(&mut self, socket: &CanBus) -> Result<()> {
         soft_zero_via_mit(self, socket)
     }
 
@@ -285,7 +277,7 @@ impl MotorDriver for RobstrideDriver {
 
     fn mit_exchange(
         &mut self,
-        socket: &CanSocket,
+        socket: &CanBus,
         position: f64,
         velocity: f64,
         kp: f64,
@@ -347,12 +339,12 @@ impl MotorDriver for RobstrideDriver {
         }
     }
 
-    fn read_position(&mut self, socket: &CanSocket) -> Result<f64> {
+    fn read_position(&mut self, socket: &CanBus) -> Result<f64> {
         let raw = self.read_param(socket, ParamIndex::MechPos)? as f64;
         Ok(self.sign() * (raw - self.soft_zero))
     }
 
-    fn read_velocity(&mut self, socket: &CanSocket) -> Result<f64> {
+    fn read_velocity(&mut self, socket: &CanBus) -> Result<f64> {
         Ok(self.sign() * self.read_param(socket, ParamIndex::MechVel)? as f64)
     }
 
@@ -370,7 +362,7 @@ impl MotorDriver for RobstrideDriver {
 /// so the read returns the raw physical position, then stores that as the
 /// new offset. The stored offset is in the motor's raw frame, so a later
 /// invert toggle leaves the calibration intact.
-fn soft_zero_via_mit<D: MotorDriver + ?Sized>(driver: &mut D, socket: &CanSocket) -> Result<()> {
+fn soft_zero_via_mit<D: MotorDriver + ?Sized>(driver: &mut D, socket: &CanBus) -> Result<()> {
     driver.set_soft_zero_offset(0.0);
     driver.enable(socket)?;
     // Brief settle so the motor is ready to report state.
@@ -522,12 +514,8 @@ impl DamiaoDriver {
         self.model
     }
 
-    fn send_std(&mut self, socket: &CanSocket, data: &[u8]) -> Result<()> {
-        let std_id = StandardId::new(self.can_id as u16)
-            .expect("DAMIAO CAN_ID must fit in 11 bits");
-        let frame = socketcan::CanFrame::new(Id::Standard(std_id), data)
-            .expect("Failed to create DAMIAO CAN frame");
-        socket.write_frame(&frame)?;
+    fn send_std(&mut self, socket: &CanBus, data: &[u8]) -> Result<()> {
+        socket.write_standard(self.can_id as u16, data)?;
         Ok(())
     }
 
@@ -537,7 +525,7 @@ impl DamiaoDriver {
     /// payloads, and frames whose payload byte 0 low nibble does not match
     /// `can_id`. If `master_id` is non-zero, additionally requires the
     /// response's standard ID to equal it.
-    fn recv_feedback(&mut self, socket: &CanSocket, timeout: Duration) -> Result<Feedback> {
+    fn recv_feedback(&mut self, socket: &CanBus, timeout: Duration) -> Result<Feedback> {
         let deadline = Instant::now() + timeout;
         loop {
             if Instant::now() >= deadline {
@@ -547,17 +535,14 @@ impl DamiaoDriver {
             }
             match socket.read_frame() {
                 Ok(frame) => {
-                    if frame.is_extended() {
+                    if frame.extended {
                         continue;
                     }
-                    let raw_id = match frame.id() {
-                        Id::Standard(sid) => StandardId::as_raw(&sid) as u16,
-                        _ => continue,
-                    };
+                    let raw_id = frame.raw_id as u16;
                     if self.master_id != 0 && raw_id != self.master_id {
                         continue;
                     }
-                    let data = frame.data();
+                    let data = &frame.data;
                     if data.len() < 8 {
                         continue;
                     }
@@ -578,19 +563,19 @@ impl DamiaoDriver {
 }
 
 impl MotorDriver for DamiaoDriver {
-    fn enable(&mut self, socket: &CanSocket) -> Result<()> {
+    fn enable(&mut self, socket: &CanBus) -> Result<()> {
         self.send_std(socket, &DM_ENABLE)?;
         let _ = self.recv_feedback(socket, Duration::from_millis(50));
         Ok(())
     }
 
-    fn disable(&mut self, socket: &CanSocket) -> Result<()> {
+    fn disable(&mut self, socket: &CanBus) -> Result<()> {
         self.send_std(socket, &DM_DISABLE)?;
         let _ = self.recv_feedback(socket, Duration::from_millis(50));
         Ok(())
     }
 
-    fn set_soft_zero(&mut self, socket: &CanSocket) -> Result<()> {
+    fn set_soft_zero(&mut self, socket: &CanBus) -> Result<()> {
         // In-memory only; the DM_SET_ZERO magic frame (FF..FE) deliberately
         // is *not* sent here, since that would write to motor NVM.
         soft_zero_via_mit(self, socket)
@@ -614,7 +599,7 @@ impl MotorDriver for DamiaoDriver {
 
     fn mit_exchange(
         &mut self,
-        socket: &CanSocket,
+        socket: &CanBus,
         position: f64,
         velocity: f64,
         kp: f64,
@@ -640,13 +625,13 @@ impl MotorDriver for DamiaoDriver {
         Ok(fb)
     }
 
-    fn read_position(&mut self, _socket: &CanSocket) -> Result<f64> {
+    fn read_position(&mut self, _socket: &CanBus) -> Result<f64> {
         Err(RobstrideError::InvalidResponse {
             msg: "DAMIAO MIT mode cannot read position while disabled".into(),
         })
     }
 
-    fn read_velocity(&mut self, _socket: &CanSocket) -> Result<f64> {
+    fn read_velocity(&mut self, _socket: &CanBus) -> Result<f64> {
         Err(RobstrideError::InvalidResponse {
             msg: "DAMIAO MIT mode cannot read velocity while disabled".into(),
         })
@@ -675,9 +660,12 @@ pub fn scan_damiao(
     interface: &str,
     range: std::ops::RangeInclusive<u8>,
     per_id_timeout: Duration,
+    fd: bool,
 ) -> Result<Vec<u8>> {
-    let socket = CanSocket::open(interface)?;
+    let socket = CanBus::open(interface, fd)?;
     socket.set_read_timeout(per_id_timeout)?;
+    // Bound sends so a stalled TX queue can't hang the scan.
+    let _ = socket.set_write_timeout(per_id_timeout);
 
     // Drain any frames already in the socket buffer so they don't
     // contaminate the very first probe.
@@ -685,13 +673,8 @@ pub fn scan_damiao(
 
     let mut found = Vec::new();
     for can_id in range {
-        let std_id = match StandardId::new(can_id as u16) {
-            Some(id) => id,
-            None => continue,
-        };
-        let enable_frame = socketcan::CanFrame::new(Id::Standard(std_id), &DM_ENABLE)
-            .expect("8-byte DM_ENABLE fits a CAN data frame");
-        if socket.write_frame(&enable_frame).is_err() {
+        // can_id is a u8, so it always fits in an 11-bit standard ID.
+        if socket.write_standard(can_id as u16, &DM_ENABLE).is_err() {
             continue;
         }
 
@@ -705,10 +688,10 @@ pub fn scan_damiao(
             }
             match socket.read_frame() {
                 Ok(frame) => {
-                    if frame.is_extended() {
+                    if frame.extended {
                         continue;
                     }
-                    let data = frame.data();
+                    let data = &frame.data;
                     if data.len() < 8 {
                         continue;
                     }
@@ -726,9 +709,7 @@ pub fn scan_damiao(
         }
 
         // Always send disable so a responding motor returns to safe state.
-        let disable_frame = socketcan::CanFrame::new(Id::Standard(std_id), &DM_DISABLE)
-            .expect("8-byte DM_DISABLE fits a CAN data frame");
-        let _ = socket.write_frame(&disable_frame);
+        let _ = socket.write_standard(can_id as u16, &DM_DISABLE);
         // Tiny gap so the motor processes the disable before the next probe.
         std::thread::sleep(Duration::from_millis(2));
     }
@@ -748,12 +729,8 @@ pub fn scan_damiao(
 /// motor is sent the magic frame and then given ~50 ms to perform the flash
 /// write before the function returns. Any reply frames during the wait are
 /// drained so the next operation starts on a clean buffer.
-pub fn damiao_set_zero_nvm(socket: &CanSocket, can_id: u8) -> Result<()> {
-    let std_id = StandardId::new(can_id as u16)
-        .expect("DAMIAO CAN_ID must fit in 11 bits");
-    let frame = socketcan::CanFrame::new(Id::Standard(std_id), &DM_SET_ZERO_NVM)
-        .expect("8-byte DM_SET_ZERO_NVM fits a CAN data frame");
-    socket.write_frame(&frame)?;
+pub fn damiao_set_zero_nvm(socket: &CanBus, can_id: u8) -> Result<()> {
+    socket.write_standard(can_id as u16, &DM_SET_ZERO_NVM)?;
     // NVM flash write can take ~10 ms; wait conservatively.
     std::thread::sleep(Duration::from_millis(50));
     while socket.read_frame_timeout(Duration::from_millis(1)).is_ok() {}

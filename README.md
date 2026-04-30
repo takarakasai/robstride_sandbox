@@ -52,6 +52,20 @@ sudo ip link set can0 up
 ip -details link show can0
 ```
 
+### CAN FD を使う場合
+
+CAN FD で通信するには、インターフェースを FD 対応で立ち上げる必要があります
+（アービトレーション用 `bitrate` に加えてデータ位相用 `dbitrate` を指定し `fd on`）。
+送信フレームは BRS（ビットレート切替）有効で送られるため、`dbitrate` が必須です。
+
+```bash
+sudo ip link set can0 type can bitrate 1000000 dbitrate 5000000 fd on
+sudo ip link set can0 up
+```
+
+その上で、TUI では `f` キー、CLI では `--fd` フラグで CAN FD 通信に切り替えます
+（下記参照）。
+
 ## ビルド
 
 ```bash
@@ -73,6 +87,7 @@ robstride_sandbox [OPTIONS] <COMMAND>
 | `--interface` | `-i` | `can0` | CAN インターフェース名 |
 | `--motor-id` | `-m` | `1` | 対象モーターの CAN ID (1-127) |
 | `--host-id` | — | `0xFD` | ホスト側 CAN ID |
+| `--fd` | — | `false` | 全通信を CAN FD（BRS 有効）で行う |
 
 ### コマンド一覧
 

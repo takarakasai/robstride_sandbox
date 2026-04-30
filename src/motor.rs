@@ -5,17 +5,16 @@
 
 use std::time::{Duration, Instant};
 
-use socketcan::{CanSocket, EmbeddedFrame, ExtendedId, Id, Socket, StandardId};
-
 use crate::error::{Result, RobstrideError};
 use crate::protocol::*;
+use crate::transport::CanBus;
 
 /// Default timeout for waiting for a motor response.
 const DEFAULT_TIMEOUT: Duration = Duration::from_millis(100);
 
 /// High-level controller for a single Robstride motor.
 pub struct Motor {
-    socket: CanSocket,
+    socket: CanBus,
     /// CAN ID of the target motor (1-254)
     motor_id: u8,
     /// Host CAN ID (default 0xFF)
@@ -40,8 +39,15 @@ impl Motor {
     /// * `motor_id` - CAN ID of the target motor (1-254)
     /// * `host_id` - Host CAN ID (default 0xFF, must be > motor_id)
     /// * `model` - Motor model for MIT scaling
-    pub fn new(interface: &str, motor_id: u8, host_id: u8, model: MotorModel) -> Result<Self> {
-        let socket = CanSocket::open(interface)?;
+    /// * `fd` - Use CAN FD framing (`true`) or Classic CAN (`false`)
+    pub fn new(
+        interface: &str,
+        motor_id: u8,
+        host_id: u8,
+        model: MotorModel,
+        fd: bool,
+    ) -> Result<Self> {
+        let socket = CanBus::open(interface, fd)?;
         socket.set_read_timeout(DEFAULT_TIMEOUT)?;
 
         let scales = MitScales::for_model(model);
@@ -94,9 +100,7 @@ impl Motor {
 
     /// Send a CAN frame with extended ID and variable-length data.
     fn send_frame(&self, can_id: u32, data: &[u8]) -> Result<()> {
-        let ext_id = ExtendedId::new(can_id).expect("Invalid extended CAN ID");
-        let frame = socketcan::CanFrame::new(ext_id, data).expect("Failed to create CAN frame");
-        self.socket.write_frame(&frame)?;
+        self.socket.write_extended(can_id, data)?;
         log::debug!(
             "TX: CAN ID=0x{:08X} data={:02X?}",
             can_id,
@@ -119,18 +123,14 @@ impl Motor {
 
             match self.socket.read_frame() {
                 Ok(frame) => {
-                    if !frame.is_extended() {
+                    if !frame.extended {
                         // Non-extended frames can occur when motor reconnects (type 0)
                         // Skip them
                         continue;
                     }
 
-                    let raw_id = match frame.id() {
-                        Id::Standard(sid) => StandardId::as_raw(&sid) as u32,
-                        Id::Extended(eid) => ExtendedId::as_raw(&eid),
-                    };
-
-                    let data = frame.data().to_vec();
+                    let raw_id = frame.raw_id;
+                    let data = frame.data;
                     let (comm_type, extra_data, device_id) = parse_can_id(raw_id);
 
                     log::debug!(
@@ -428,8 +428,9 @@ impl Motor {
         host_id: u8,
         id_range: std::ops::RangeInclusive<u8>,
         timeout_per_id: Duration,
+        fd: bool,
     ) -> Vec<(u8, Option<Vec<u8>>)> {
-        let socket = match CanSocket::open(interface) {
+        let socket = match CanBus::open(interface, fd) {
             Ok(s) => s,
             Err(e) => {
                 log::error!("Failed to open CAN socket '{}': {}", interface, e);
@@ -437,22 +438,14 @@ impl Motor {
             }
         };
         let _ = socket.set_read_timeout(timeout_per_id);
+        let _ = socket.set_write_timeout(timeout_per_id);
 
         let mut found = Vec::new();
 
         for motor_id in id_range {
             let (can_id, data) = build_ping_frame(host_id, motor_id);
 
-            let ext_id = match ExtendedId::new(can_id) {
-                Some(id) => id,
-                None => continue,
-            };
-            let frame = match socketcan::CanFrame::new(ext_id, &data) {
-                Some(f) => f,
-                None => continue,
-            };
-
-            if socket.write_frame(&frame).is_err() {
+            if socket.write_extended(can_id, &data).is_err() {
                 continue;
             }
 
@@ -463,14 +456,10 @@ impl Motor {
             while start.elapsed() < timeout_per_id {
                 match socket.read_frame() {
                     Ok(resp) => {
-                        if !resp.is_extended() {
+                        if !resp.extended {
                             continue;
                         }
-                        let raw_id = match resp.id() {
-                            Id::Standard(sid) => StandardId::as_raw(&sid) as u32,
-                            Id::Extended(eid) => ExtendedId::as_raw(&eid),
-                        };
-                        let (ct, extra, dev_id) = parse_can_id(raw_id);
+                        let (ct, extra, dev_id) = parse_can_id(resp.raw_id);
 
                         // In Robstride responses, the CAN ID layout is:
                         //   device_id field (bits 7-0)  = host_id (echo back)
@@ -487,7 +476,7 @@ impl Motor {
 
                         // Check if this response is from the motor we pinged
                         if resp_motor_id == motor_id || dev_id == motor_id {
-                            found.push((motor_id, Some(resp.data().to_vec())));
+                            found.push((motor_id, Some(resp.data)));
                             break;
                         }
                     }
@@ -509,6 +498,7 @@ impl Motor {
         host_id: u8,
         id_range: std::ops::RangeInclusive<u8>,
         timeout_per_id: Duration,
+        fd: bool,
         mut on_progress: F,
     ) -> Vec<(u8, Option<Vec<u8>>)>
     where
@@ -517,7 +507,7 @@ impl Motor {
         let ids: Vec<u8> = id_range.collect();
         let total = ids.len();
 
-        let socket = match CanSocket::open(interface) {
+        let socket = match CanBus::open(interface, fd) {
             Ok(s) => s,
             Err(e) => {
                 log::error!("Failed to open CAN socket '{}': {}", interface, e);
@@ -525,6 +515,9 @@ impl Motor {
             }
         };
         let _ = socket.set_read_timeout(timeout_per_id);
+        // Bound sends too: a blocking write with no timeout can stall the whole
+        // scan (and freeze the progress bar mid-range) if the TX queue backs up.
+        let _ = socket.set_write_timeout(timeout_per_id);
 
         let mut found = Vec::new();
 
@@ -533,16 +526,7 @@ impl Motor {
 
             let (can_id, data) = build_ping_frame(host_id, motor_id);
 
-            let ext_id = match ExtendedId::new(can_id) {
-                Some(id) => id,
-                None => continue,
-            };
-            let frame = match socketcan::CanFrame::new(ext_id, &data) {
-                Some(f) => f,
-                None => continue,
-            };
-
-            if socket.write_frame(&frame).is_err() {
+            if socket.write_extended(can_id, &data).is_err() {
                 continue;
             }
 
@@ -550,20 +534,16 @@ impl Motor {
             while start.elapsed() < timeout_per_id {
                 match socket.read_frame() {
                     Ok(resp) => {
-                        if !resp.is_extended() {
+                        if !resp.extended {
                             continue;
                         }
-                        let raw_id = match resp.id() {
-                            Id::Standard(sid) => StandardId::as_raw(&sid) as u32,
-                            Id::Extended(eid) => ExtendedId::as_raw(&eid),
-                        };
-                        let (ct, extra, dev_id) = parse_can_id(raw_id);
+                        let (ct, extra, dev_id) = parse_can_id(resp.raw_id);
                         let resp_motor_id = (extra & 0xFF) as u8;
                         if dev_id == motor_id && ct == 0 {
                             continue;
                         }
                         if resp_motor_id == motor_id || dev_id == motor_id {
-                            found.push((motor_id, Some(resp.data().to_vec())));
+                            found.push((motor_id, Some(resp.data)));
                             break;
                         }
                     }
@@ -581,8 +561,9 @@ impl Motor {
     pub fn dump_bus(
         interface: &str,
         duration: Duration,
+        fd: bool,
     ) -> Vec<(u32, Vec<u8>)> {
-        let socket = match CanSocket::open(interface) {
+        let socket = match CanBus::open(interface, fd) {
             Ok(s) => s,
             Err(e) => {
                 log::error!("Failed to open CAN socket '{}': {}", interface, e);
@@ -597,11 +578,7 @@ impl Motor {
         while start.elapsed() < duration {
             match socket.read_frame() {
                 Ok(frame) => {
-                    let raw_id = match frame.id() {
-                        Id::Standard(sid) => StandardId::as_raw(&sid) as u32,
-                        Id::Extended(eid) => ExtendedId::as_raw(&eid),
-                    };
-                    frames.push((raw_id, frame.data().to_vec()));
+                    frames.push((frame.raw_id, frame.data));
                 }
                 Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
                 Err(_) => break,

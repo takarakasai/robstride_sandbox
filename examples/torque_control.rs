@@ -29,7 +29,7 @@ fn main() -> Result<()> {
     println!("Starting in 3 seconds...");
     std::thread::sleep(Duration::from_secs(3));
 
-    let mut motor = Motor::new(&interface, motor_id, 0xFF, MotorModel::Rs05)?;
+    let mut motor = Motor::new(&interface, motor_id, 0xFF, MotorModel::Rs05, false)?;
 
     // Configure torque mode
     motor.disable()?;

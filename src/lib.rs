@@ -15,7 +15,7 @@
 //! ```no_run
 //! use robstride_sandbox::{motor::Motor, protocol::{MotorModel, RunMode}};
 //!
-//! let mut motor = Motor::new("can0", 1, 0xFF, MotorModel::Rs05)?;
+//! let mut motor = Motor::new("can0", 1, 0xFF, MotorModel::Rs05, false)?;
 //! motor.enable()?;
 //! motor.set_run_mode(RunMode::Position)?;
 //! motor.set_position(3.14)?;
@@ -32,3 +32,4 @@ pub mod error;
 pub mod motor;
 pub mod protocol;
 pub mod serial_can;
+pub mod transport;

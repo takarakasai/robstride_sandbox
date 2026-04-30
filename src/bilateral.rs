@@ -18,7 +18,7 @@ use std::sync::{
 };
 use std::time::{Duration, Instant};
 
-use socketcan::{CanSocket, Socket};
+use crate::transport::CanBus;
 
 use crate::driver::MotorSpec;
 use crate::error::Result;
@@ -336,6 +336,8 @@ impl DisturbanceObserver {
 #[derive(Debug, Clone)]
 pub struct BilateralConfig {
     pub interface: String,
+    /// Use CAN FD framing for all bus traffic (`true`) or Classic CAN.
+    pub use_fd: bool,
     pub leader: MotorSpec,
     pub follower: MotorSpec,
     pub method: BilateralMethod,
@@ -364,6 +366,7 @@ impl Default for BilateralConfig {
     fn default() -> Self {
         BilateralConfig {
             interface: "can0".to_string(),
+            use_fd: false,
             leader: MotorSpec::robstride(0xFD, 10, MotorModel::Rs05),
             follower: MotorSpec::robstride(0xFD, 1, MotorModel::Rs05),
             method: BilateralMethod::VirtualCoupling,
@@ -444,7 +447,7 @@ fn run_bilateral_loop(
     telemetry: &SharedTelemetry,
     stop: &StopFlag,
 ) -> Result<()> {
-    let socket = CanSocket::open(&config.interface)?;
+    let socket = CanBus::open(&config.interface, config.use_fd)?;
     socket.set_read_timeout(Duration::from_millis(10))?;
 
     // Host-ID collision sniff. Before we transmit anything, listen for a
@@ -1121,7 +1124,7 @@ fn run_ondemand_loop(
     telemetry: &SharedTelemetry,
     stop: &StopFlag,
 ) -> Result<()> {
-    let socket = CanSocket::open(&config.interface)?;
+    let socket = CanBus::open(&config.interface, config.use_fd)?;
     socket.set_read_timeout(Duration::from_millis(10))?;
 
     let mut leader = config.leader.build();
@@ -1344,7 +1347,7 @@ fn run_emulated_ondemand_loop(
     telemetry: &SharedTelemetry,
     stop: &StopFlag,
 ) -> Result<()> {
-    let socket = CanSocket::open(&config.interface)?;
+    let socket = CanBus::open(&config.interface, config.use_fd)?;
     socket.set_read_timeout(Duration::from_millis(10))?;
 
     let mut leader = config.leader.build();
@@ -1513,6 +1516,8 @@ fn run_emulated_ondemand_loop(
 #[derive(Debug, Clone)]
 pub struct AssistTestConfig {
     pub interface: String,
+    /// Use CAN FD framing for all bus traffic (`true`) or Classic CAN.
+    pub use_fd: bool,
     pub motor: MotorSpec,
     /// Motor-internal kd for velocity assist
     pub assist_kd: f64,
@@ -1539,6 +1544,7 @@ impl Default for AssistTestConfig {
     fn default() -> Self {
         AssistTestConfig {
             interface: "can0".to_string(),
+            use_fd: false,
             motor: MotorSpec::robstride(0xFD, 10, MotorModel::Rs05),
             assist_kd: 0.0,
             vel_ahead: 2.0,
@@ -1585,7 +1591,7 @@ fn run_assist_test_loop(
     telemetry: &SharedTelemetry,
     stop: &StopFlag,
 ) -> Result<()> {
-    let socket = CanSocket::open(&config.interface)?;
+    let socket = CanBus::open(&config.interface, config.use_fd)?;
     socket.set_read_timeout(Duration::from_millis(10))?;
 
     let mut motor = config.motor.build();
