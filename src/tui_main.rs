@@ -18,6 +18,7 @@ use serde::{Deserialize, Serialize};
 
 use robstride_sandbox::bilateral::{self, AssistTestConfig, BilateralConfig, BilateralGains, BilateralMethod, SharedTelemetry, StopFlag};
 use robstride_sandbox::driver::{DamiaoModel, MotorSpec};
+use socketcan::{CanSocket, Socket};
 use robstride_sandbox::motor::Motor;
 use robstride_sandbox::protocol::{MotorFeedback, MotorModel, ParamIndex, RunMode};
 
@@ -225,6 +226,14 @@ fn params_for_command(cmd: Command) -> Vec<ParamField> {
             ParamField::with_choices("open_sign", "0", "Opening dir (ondemand: 0=off, +1/-1)",
                 "-1|0|+1"),
         ],
+        Command::ZeroPair => vec![
+            ParamField::with_choices("lead_kind", "rs05", "Leader motor kind",
+                MOTOR_KIND_CHOICES),
+            ParamField::new("lead_id", "10", "Leader CAN ID"),
+            ParamField::with_choices("foll_kind", "rs05", "Follower motor kind",
+                MOTOR_KIND_CHOICES),
+            ParamField::new("foll_id", "1", "Follower CAN ID"),
+        ],
         Command::AssistTest => vec![
             ParamField::with_choices("motor_kind", "rs05", "Motor kind", MOTOR_KIND_CHOICES),
             ParamField::new("motor_id", "10", "Motor CAN ID to test"),
@@ -259,11 +268,12 @@ enum Command {
     Torque,
     MitControl,
     Bilateral,
+    ZeroPair,
     AssistTest,
 }
 
 impl Command {
-    const ALL: [Command; 15] = [
+    const ALL: [Command; 16] = [
         Command::Scan,
         Command::Ping,
         Command::Enable,
@@ -278,6 +288,7 @@ impl Command {
         Command::Torque,
         Command::MitControl,
         Command::Bilateral,
+        Command::ZeroPair,
         Command::AssistTest,
     ];
 
@@ -297,6 +308,7 @@ impl Command {
             Command::Torque => "Torque",
             Command::MitControl => "MIT Control",
             Command::Bilateral => "Bilateral Ctrl",
+            Command::ZeroPair => "Zero Pair",
             Command::AssistTest => "Assist Test",
         }
     }
@@ -951,6 +963,59 @@ impl App {
         }
     }
 
+    /// Zero both the leader and follower at their current physical positions.
+    /// Run with both joints held at the desired neutral pose before starting
+    /// bilateral control, otherwise the initial position error will yank both
+    /// motors.
+    fn execute_zero_pair(&mut self, input: &str) {
+        if self.bilateral_stop.is_some() {
+            self.log_msg("Bilateral loop is running; stop it first.".to_string());
+            return;
+        }
+
+        let parts: Vec<&str> = input.trim().split_whitespace().collect();
+        let get = |i: usize| parts.get(i).copied();
+
+        let (leader, lw) = parse_motor_kind(
+            get(0).unwrap_or("rs05"),
+            get(1).unwrap_or("10"),
+            10,
+            self.host_id,
+            self.default_model,
+        );
+        if let Some(w) = lw { self.log_msg(format!("Leader: {}", w)); }
+        let (follower, fw) = parse_motor_kind(
+            get(2).unwrap_or("rs05"),
+            get(3).unwrap_or("1"),
+            1,
+            self.host_id,
+            self.default_model,
+        );
+        if let Some(w) = fw { self.log_msg(format!("Follower: {}", w)); }
+
+        let socket = match CanSocket::open(&self.interface) {
+            Ok(s) => s,
+            Err(e) => {
+                self.log_msg(format!("CAN open error: {}", e));
+                return;
+            }
+        };
+        if let Err(e) = socket.set_read_timeout(Duration::from_millis(100)) {
+            self.log_msg(format!("Set read timeout failed: {}", e));
+        }
+
+        let lead = leader.build();
+        let foll = follower.build();
+        match lead.set_zero(&socket) {
+            Ok(()) => self.log_msg(format!("Zero set: {}", lead.description())),
+            Err(e) => self.log_msg(format!("Zero set {} failed: {}", lead.description(), e)),
+        }
+        match foll.set_zero(&socket) {
+            Ok(()) => self.log_msg(format!("Zero set: {}", foll.description())),
+            Err(e) => self.log_msg(format!("Zero set {} failed: {}", foll.description(), e)),
+        }
+    }
+
     fn execute_bilateral(&mut self, input: &str) {
         // If already running, stop it
         if self.bilateral_stop.is_some() {
@@ -1084,6 +1149,7 @@ impl App {
             Command::Torque => self.execute_torque(input),
             Command::MitControl => self.execute_mit(input),
             Command::Bilateral => self.execute_bilateral(input),
+            Command::ZeroPair => self.execute_zero_pair(input),
             Command::AssistTest => self.execute_assist_test(input),
         }
     }

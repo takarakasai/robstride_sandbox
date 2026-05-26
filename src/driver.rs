@@ -34,6 +34,11 @@ pub trait MotorDriver: Send {
     /// Disable the motor (free-spin / zero output).
     fn disable(&self, socket: &CanSocket) -> Result<()>;
 
+    /// Latch the current physical position as the motor's zero reference.
+    /// On both vendors this persists to NVM and survives power cycles.
+    /// Must be issued with the joint held physically at the desired neutral.
+    fn set_zero(&self, socket: &CanSocket) -> Result<()>;
+
     /// Send one MIT-mode command frame and return the resulting feedback.
     ///
     /// `position` [rad], `velocity` [rad/s], `kp` [Nm/rad], `kd` [Nm·s/rad],
@@ -167,6 +172,13 @@ impl MotorDriver for RobstrideDriver {
         Ok(())
     }
 
+    fn set_zero(&self, socket: &CanSocket) -> Result<()> {
+        let (can_id, data) = build_set_zero_frame(self.host_id, self.motor_id);
+        send_can(socket, can_id, &data)?;
+        let _ = recv_can(socket, Duration::from_millis(50));
+        Ok(())
+    }
+
     fn mit_exchange(
         &self,
         socket: &CanSocket,
@@ -253,6 +265,7 @@ impl MotorDriver for RobstrideDriver {
 
 const DM_ENABLE: [u8; 8] = [0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFC];
 const DM_DISABLE: [u8; 8] = [0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFD];
+const DM_SET_ZERO: [u8; 8] = [0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFE];
 
 /// DAMIAO motor model.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -413,6 +426,14 @@ impl MotorDriver for DamiaoDriver {
     fn disable(&self, socket: &CanSocket) -> Result<()> {
         self.send_std(socket, &DM_DISABLE)?;
         let _ = self.recv_feedback(socket, Duration::from_millis(50));
+        Ok(())
+    }
+
+    fn set_zero(&self, socket: &CanSocket) -> Result<()> {
+        // DM saves the zero-offset to NVM, which can take ~10 ms; give the
+        // motor a longer window to respond than we do for enable/disable.
+        self.send_std(socket, &DM_SET_ZERO)?;
+        let _ = self.recv_feedback(socket, Duration::from_millis(100));
         Ok(())
     }
 
