@@ -17,9 +17,34 @@ use ratatui::widgets::*;
 use serde::{Deserialize, Serialize};
 
 use robstride_sandbox::bilateral::{self, AssistTestConfig, BilateralConfig, BilateralGains, BilateralMethod, SharedTelemetry, StopFlag};
-use robstride_sandbox::driver::MotorSpec;
+use robstride_sandbox::driver::{DamiaoModel, MotorSpec};
 use robstride_sandbox::motor::Motor;
 use robstride_sandbox::protocol::{MotorFeedback, MotorModel, ParamIndex, RunMode};
+
+/// Choice string presented to the user for motor kind selection. Keep in
+/// sync with [`parse_motor_kind`].
+const MOTOR_KIND_CHOICES: &str = "rs00|rs01|rs02|rs03|rs04|rs05|rs06|dm4310";
+
+/// Parse a motor-kind string (as shown in the param choice list) into a
+/// [`MotorSpec`]. Falls back to Robstride with `default_model` if `kind` is
+/// unrecognised; a non-numeric `id` falls back to `default_id`.
+fn parse_motor_kind(
+    kind: &str,
+    id_str: &str,
+    default_id: u8,
+    host_id: u8,
+    default_model: MotorModel,
+) -> MotorSpec {
+    let id: u8 = id_str.parse().unwrap_or(default_id);
+    if let Some(model) = MotorModel::from_str(kind) {
+        return MotorSpec::robstride(host_id, id, model);
+    }
+    if let Some(model) = DamiaoModel::from_str_ci(kind) {
+        // master_id = 0 means "match any standard ID, filter by payload nibble".
+        return MotorSpec::damiao(id, 0, model);
+    }
+    MotorSpec::robstride(host_id, id, default_model)
+}
 
 const APP_NAME: &str = "robstride_sandbox";
 
@@ -170,6 +195,12 @@ fn params_for_command(cmd: Command) -> Vec<ParamField> {
             ParamField::new("torque", "0.0", "Torque FF [Nm]"),
         ],
         Command::Bilateral => vec![
+            ParamField::with_choices("lead_kind", "rs05", "Leader motor kind",
+                MOTOR_KIND_CHOICES),
+            ParamField::new("lead_id", "10", "Leader CAN ID"),
+            ParamField::with_choices("foll_kind", "rs05", "Follower motor kind",
+                MOTOR_KIND_CHOICES),
+            ParamField::new("foll_id", "1", "Follower CAN ID"),
             ParamField::with_choices("method", "coupling", "Control method",
                 "pos|force|coupling|mode|ondemand"),
             ParamField::new("kp", "5.0", "Spring stiffness [Nm/rad]"),
@@ -189,6 +220,7 @@ fn params_for_command(cmd: Command) -> Vec<ParamField> {
                 "-1|0|+1"),
         ],
         Command::AssistTest => vec![
+            ParamField::with_choices("motor_kind", "rs05", "Motor kind", MOTOR_KIND_CHOICES),
             ParamField::new("motor_id", "10", "Motor CAN ID to test"),
             ParamField::new("assist_kd", "0.0", "Motor-internal kd assist [Nm·s/rad] (0=off)"),
             ParamField::new("vel_ahead", "2.0", "Vel ref lookahead (1=off, 2-3 typ)"),
@@ -865,25 +897,33 @@ impl App {
             return;
         }
 
+        // Param order matches Command::AssistTest in params_for_command:
+        //   0: motor_kind, 1: motor_id, 2: assist_kd, 3: vel_ahead,
+        //   4: max_assist, 5: coulomb, 6: viscous, 7: inertia,
+        //   8: inertia_comp, 9: accel_cutoff
         let parts: Vec<&str> = input.trim().split_whitespace().collect();
-        let mut motor_id: u8 = 10;
+        let get = |i: usize| parts.get(i).copied();
+
+        let motor = parse_motor_kind(
+            get(0).unwrap_or("rs05"),
+            get(1).unwrap_or("10"),
+            10,
+            self.host_id,
+            self.default_model,
+        );
         let mut cfg = AssistTestConfig {
             interface: self.interface.clone(),
-            motor: MotorSpec::robstride(self.host_id, motor_id, self.default_model),
+            motor,
             ..Default::default()
         };
-        if parts.len() > 0 {
-            motor_id = parts[0].parse().unwrap_or(motor_id);
-            cfg.motor = MotorSpec::robstride(self.host_id, motor_id, self.default_model);
-        }
-        if parts.len() > 1 { cfg.assist_kd = parts[1].parse().unwrap_or(cfg.assist_kd); }
-        if parts.len() > 2 { cfg.vel_ahead = parts[2].parse().unwrap_or(cfg.vel_ahead); }
-        if parts.len() > 3 { cfg.max_assist = parts[3].parse().unwrap_or(cfg.max_assist); }
-        if parts.len() > 4 { cfg.coulomb_friction = parts[4].parse().unwrap_or(cfg.coulomb_friction); }
-        if parts.len() > 5 { cfg.viscous_friction = parts[5].parse().unwrap_or(cfg.viscous_friction); }
-        if parts.len() > 6 { cfg.inertia = parts[6].parse().unwrap_or(cfg.inertia); }
-        if parts.len() > 7 { cfg.inertia_comp = parts[7].parse().unwrap_or(cfg.inertia_comp); }
-        if parts.len() > 8 { cfg.accel_cutoff = parts[8].parse().unwrap_or(cfg.accel_cutoff); }
+        if let Some(s) = get(2) { cfg.assist_kd = s.parse().unwrap_or(cfg.assist_kd); }
+        if let Some(s) = get(3) { cfg.vel_ahead = s.parse().unwrap_or(cfg.vel_ahead); }
+        if let Some(s) = get(4) { cfg.max_assist = s.parse().unwrap_or(cfg.max_assist); }
+        if let Some(s) = get(5) { cfg.coulomb_friction = s.parse().unwrap_or(cfg.coulomb_friction); }
+        if let Some(s) = get(6) { cfg.viscous_friction = s.parse().unwrap_or(cfg.viscous_friction); }
+        if let Some(s) = get(7) { cfg.inertia = s.parse().unwrap_or(cfg.inertia); }
+        if let Some(s) = get(8) { cfg.inertia_comp = s.parse().unwrap_or(cfg.inertia_comp); }
+        if let Some(s) = get(9) { cfg.accel_cutoff = s.parse().unwrap_or(cfg.accel_cutoff); }
 
         self.log_msg(format!(
             "Starting Assist Test: {}, kd={:.2}, vel_ah={:.1}, maxA={:.3}, Cf={:.3}, Vf={:.3}, J={:.4}, IC={:.1}, AC={:.0}",
@@ -911,9 +951,31 @@ impl App {
             return;
         }
 
-        // Parse: method [kp kd [coulomb_friction viscous_friction] [force_scale] [inertia dob_cutoff]]
+        // Param order matches Command::Bilateral in params_for_command:
+        //   0: lead_kind, 1: lead_id, 2: foll_kind, 3: foll_id, 4: method,
+        //   5: kp, 6: kd, 7: coulomb, 8: viscous, 9: force_scale,
+        //   10: inertia, 11: dob_cutoff, 12: inertia_comp, 13: accel_cutoff,
+        //   14: assist_kd, 15: vel_ahead, 16: max_assist,
+        //   17: force_threshold, 18: open_sign
         let parts: Vec<&str> = input.trim().split_whitespace().collect();
-        let method_str = if !parts.is_empty() { parts[0] } else { "coupling" };
+        let get = |i: usize| parts.get(i).copied();
+
+        let leader = parse_motor_kind(
+            get(0).unwrap_or("rs05"),
+            get(1).unwrap_or("10"),
+            10,
+            self.host_id,
+            self.default_model,
+        );
+        let follower = parse_motor_kind(
+            get(2).unwrap_or("rs05"),
+            get(3).unwrap_or("1"),
+            1,
+            self.host_id,
+            self.default_model,
+        );
+
+        let method_str = get(4).unwrap_or("coupling");
         let method = match BilateralMethod::from_short(method_str) {
             Some(m) => m,
             None => {
@@ -926,55 +988,29 @@ impl App {
         };
 
         let mut gains = BilateralGains::default();
-        if parts.len() > 1 {
-            gains.kp = parts[1].parse().unwrap_or(gains.kp);
-        }
-        if parts.len() > 2 {
-            gains.kd = parts[2].parse().unwrap_or(gains.kd);
-        }
-        if parts.len() > 3 {
-            gains.coulomb_friction = parts[3].parse().unwrap_or(gains.coulomb_friction);
-        }
-        if parts.len() > 4 {
-            gains.viscous_friction = parts[4].parse().unwrap_or(gains.viscous_friction);
-        }
-        if parts.len() > 5 {
-            gains.force_scale = parts[5].parse().unwrap_or(gains.force_scale);
-        }
-        if parts.len() > 6 {
-            gains.inertia = parts[6].parse().unwrap_or(gains.inertia);
-        }
-        if parts.len() > 7 {
-            gains.dob_cutoff = parts[7].parse().unwrap_or(gains.dob_cutoff);
-        }
-        if parts.len() > 8 {
-            gains.inertia_comp = parts[8].parse().unwrap_or(gains.inertia_comp);
-        }
-        if parts.len() > 9 {
-            gains.accel_cutoff = parts[9].parse().unwrap_or(gains.accel_cutoff);
-        }
-        if parts.len() > 10 {
-            gains.assist_kd = parts[10].parse().unwrap_or(gains.assist_kd);
-        }
-        if parts.len() > 11 {
-            gains.vel_ahead = parts[11].parse().unwrap_or(gains.vel_ahead);
-        }
-        if parts.len() > 12 {
-            gains.max_assist = parts[12].parse().unwrap_or(gains.max_assist);
-        }
-        if parts.len() > 13 {
-            gains.force_threshold = parts[13].parse().unwrap_or(gains.force_threshold);
-        }
-        if parts.len() > 14 {
+        if let Some(s) = get(5) { gains.kp = s.parse().unwrap_or(gains.kp); }
+        if let Some(s) = get(6) { gains.kd = s.parse().unwrap_or(gains.kd); }
+        if let Some(s) = get(7) { gains.coulomb_friction = s.parse().unwrap_or(gains.coulomb_friction); }
+        if let Some(s) = get(8) { gains.viscous_friction = s.parse().unwrap_or(gains.viscous_friction); }
+        if let Some(s) = get(9) { gains.force_scale = s.parse().unwrap_or(gains.force_scale); }
+        if let Some(s) = get(10) { gains.inertia = s.parse().unwrap_or(gains.inertia); }
+        if let Some(s) = get(11) { gains.dob_cutoff = s.parse().unwrap_or(gains.dob_cutoff); }
+        if let Some(s) = get(12) { gains.inertia_comp = s.parse().unwrap_or(gains.inertia_comp); }
+        if let Some(s) = get(13) { gains.accel_cutoff = s.parse().unwrap_or(gains.accel_cutoff); }
+        if let Some(s) = get(14) { gains.assist_kd = s.parse().unwrap_or(gains.assist_kd); }
+        if let Some(s) = get(15) { gains.vel_ahead = s.parse().unwrap_or(gains.vel_ahead); }
+        if let Some(s) = get(16) { gains.max_assist = s.parse().unwrap_or(gains.max_assist); }
+        if let Some(s) = get(17) { gains.force_threshold = s.parse().unwrap_or(gains.force_threshold); }
+        if let Some(s) = get(18) {
             // Parse +1, -1, 0 (strip leading '+')
-            let s = parts[14].trim_start_matches('+');
-            gains.open_sign = s.parse().unwrap_or(gains.open_sign);
+            let trimmed = s.trim_start_matches('+');
+            gains.open_sign = trimmed.parse().unwrap_or(gains.open_sign);
         }
 
         let config = BilateralConfig {
             interface: self.interface.clone(),
-            leader: MotorSpec::robstride(self.host_id, 10, self.default_model),
-            follower: MotorSpec::robstride(self.host_id, 1, self.default_model),
+            leader,
+            follower,
             method,
             ondemand: false,
             gains,
