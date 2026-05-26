@@ -17,6 +17,7 @@ use ratatui::widgets::*;
 use serde::{Deserialize, Serialize};
 
 use robstride_sandbox::bilateral::{self, AssistTestConfig, BilateralConfig, BilateralGains, BilateralMethod, SharedTelemetry, StopFlag};
+use robstride_sandbox::driver::MotorSpec;
 use robstride_sandbox::motor::Motor;
 use robstride_sandbox::protocol::{MotorFeedback, MotorModel, ParamIndex, RunMode};
 
@@ -865,13 +866,16 @@ impl App {
         }
 
         let parts: Vec<&str> = input.trim().split_whitespace().collect();
+        let mut motor_id: u8 = 10;
         let mut cfg = AssistTestConfig {
             interface: self.interface.clone(),
-            host_id: self.host_id,
-            model: self.default_model,
+            motor: MotorSpec::robstride(self.host_id, motor_id, self.default_model),
             ..Default::default()
         };
-        if parts.len() > 0 { cfg.motor_id = parts[0].parse().unwrap_or(cfg.motor_id); }
+        if parts.len() > 0 {
+            motor_id = parts[0].parse().unwrap_or(motor_id);
+            cfg.motor = MotorSpec::robstride(self.host_id, motor_id, self.default_model);
+        }
         if parts.len() > 1 { cfg.assist_kd = parts[1].parse().unwrap_or(cfg.assist_kd); }
         if parts.len() > 2 { cfg.vel_ahead = parts[2].parse().unwrap_or(cfg.vel_ahead); }
         if parts.len() > 3 { cfg.max_assist = parts[3].parse().unwrap_or(cfg.max_assist); }
@@ -882,8 +886,8 @@ impl App {
         if parts.len() > 8 { cfg.accel_cutoff = parts[8].parse().unwrap_or(cfg.accel_cutoff); }
 
         self.log_msg(format!(
-            "Starting Assist Test: ID={}, kd={:.2}, vel_ah={:.1}, maxA={:.3}, Cf={:.3}, Vf={:.3}, J={:.4}, IC={:.1}, AC={:.0}",
-            cfg.motor_id, cfg.assist_kd, cfg.vel_ahead, cfg.max_assist,
+            "Starting Assist Test: {}, kd={:.2}, vel_ah={:.1}, maxA={:.3}, Cf={:.3}, Vf={:.3}, J={:.4}, IC={:.1}, AC={:.0}",
+            cfg.motor.description(), cfg.assist_kd, cfg.vel_ahead, cfg.max_assist,
             cfg.coulomb_friction, cfg.viscous_friction,
             cfg.inertia, cfg.inertia_comp, cfg.accel_cutoff,
         ));
@@ -969,10 +973,8 @@ impl App {
 
         let config = BilateralConfig {
             interface: self.interface.clone(),
-            host_id: self.host_id,
-            leader_id: 10,
-            follower_id: 1,
-            model: self.default_model,
+            leader: MotorSpec::robstride(self.host_id, 10, self.default_model),
+            follower: MotorSpec::robstride(self.host_id, 1, self.default_model),
             method,
             ondemand: false,
             gains,
@@ -988,9 +990,9 @@ impl App {
             gains.viscous_friction,
         ));
         self.log_msg(format!(
-            "  Leader=ID:{}, Follower=ID:{}  Press Esc to stop.",
-            config.leader_id,
-            config.follower_id,
+            "  Leader={}, Follower={}  Press Esc to stop.",
+            config.leader.description(),
+            config.follower.description(),
         ));
 
         match bilateral::launch_bilateral(config) {

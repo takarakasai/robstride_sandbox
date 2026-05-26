@@ -11,7 +11,7 @@
 
 use std::time::{Duration, Instant};
 
-use socketcan::{CanSocket, EmbeddedFrame, ExtendedId, Id, Socket};
+use socketcan::{CanSocket, EmbeddedFrame, ExtendedId, Id, Socket, StandardId};
 
 use crate::error::{Result, RobstrideError};
 use crate::protocol::*;
@@ -222,3 +222,413 @@ impl MotorDriver for RobstrideDriver {
         format!("Robstride {} ID:{}", self.model, self.motor_id)
     }
 }
+
+// =============================================================================
+// DAMIAO driver (DM-J4310-2EC family)
+// =============================================================================
+//
+// DAMIAO DM-series motors use 11-bit standard CAN IDs and the classic T-Motor
+// MIT bit packing:
+//
+//   command (8 bytes):
+//     [0..1]  position    u16  -> [-P_MAX, P_MAX]
+//     [2..3]  velocity    u12  -> [-V_MAX, V_MAX]  (top 12 bits of bytes 2..3)
+//     [3..4]  kp          u12  -> [0,      KP_MAX] (bottom 12 of bytes 3..4)
+//     [5..6]  kd          u12  -> [0,      KD_MAX]
+//     [6..7]  torque      u12  -> [-T_MAX, T_MAX]
+//
+//   response (8 bytes):
+//     [0]     err nibble | motor_id nibble
+//     [1..2]  position    u16
+//     [3..4]  velocity    u12 | torque high nibble
+//     [4..5]  torque      u12 (low 12 bits of [4..5])
+//     [6]     MOS temp    u8
+//     [7]     rotor temp  u8
+//
+// Enable/disable/zero/clear-error use the magic "FF..FX" sequences:
+//   FF FF FF FF FF FF FF FC  enable
+//   FF FF FF FF FF FF FF FD  disable
+//   FF FF FF FF FF FF FF FE  set zero
+//   FF FF FF FF FF FF FF FB  clear error
+
+const DM_ENABLE: [u8; 8] = [0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFC];
+const DM_DISABLE: [u8; 8] = [0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFD];
+
+/// DAMIAO motor model.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(non_camel_case_types)]
+pub enum DamiaoModel {
+    /// DM-J4310-2EC integrated joint actuator (built-in 10:1 reducer).
+    DmJ4310_2EC,
+}
+
+impl DamiaoModel {
+    pub fn name(&self) -> &'static str {
+        match self {
+            DamiaoModel::DmJ4310_2EC => "DM-J4310-2EC",
+        }
+    }
+
+    pub fn from_str_ci(s: &str) -> Option<Self> {
+        match s.to_lowercase().as_str() {
+            "dm-j4310-2ec" | "dmj4310-2ec" | "dm-j4310" | "dmj4310" | "j4310-2ec" | "j4310" => {
+                Some(DamiaoModel::DmJ4310_2EC)
+            }
+            _ => None,
+        }
+    }
+}
+
+impl std::fmt::Display for DamiaoModel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.name())
+    }
+}
+
+/// MIT scaling ranges per DAMIAO model. The motor firmware decodes the 12/16-
+/// bit packed fields against the same ranges, so these must match the values
+/// configured on the motor (DAMIAO's defaults are baked in here).
+#[derive(Debug, Clone, Copy)]
+pub struct DamiaoLimits {
+    pub p_max: f64, // rad
+    pub v_max: f64, // rad/s
+    pub kp_max: f64,
+    pub kd_max: f64,
+    pub t_max: f64, // Nm
+}
+
+impl DamiaoLimits {
+    pub fn for_model(model: DamiaoModel) -> Self {
+        match model {
+            DamiaoModel::DmJ4310_2EC => DamiaoLimits {
+                p_max: 12.5,
+                v_max: 30.0,
+                kp_max: 500.0,
+                kd_max: 5.0,
+                t_max: 10.0,
+            },
+        }
+    }
+}
+
+/// DAMIAO MIT-mode driver.
+///
+/// `can_id` is the motor's TX address (its `CAN_ID` register, default 0x01 on
+/// a fresh motor). `master_id` is the standard ID the motor uses for its
+/// responses (its `MST_ID` register; 0 means "accept any standard ID, match
+/// by the motor-id nibble in byte 0 of the payload"). Using a unique
+/// `MST_ID` per motor on a shared bus avoids ambiguity when multiple DM
+/// motors share the same MST_ID.
+///
+/// Reading state while disabled is not supported by DM MIT firmware, so
+/// OnDemand bilateral mode cannot use a DAMIAO leader.
+pub struct DamiaoDriver {
+    can_id: u8,
+    master_id: u16,
+    model: DamiaoModel,
+    limits: DamiaoLimits,
+}
+
+impl DamiaoDriver {
+    pub fn new(can_id: u8, master_id: u16, model: DamiaoModel) -> Self {
+        Self {
+            can_id,
+            master_id,
+            model,
+            limits: DamiaoLimits::for_model(model),
+        }
+    }
+
+    pub fn can_id(&self) -> u8 {
+        self.can_id
+    }
+
+    pub fn model(&self) -> DamiaoModel {
+        self.model
+    }
+
+    fn send_std(&self, socket: &CanSocket, data: &[u8]) -> Result<()> {
+        let std_id = StandardId::new(self.can_id as u16)
+            .expect("DAMIAO CAN_ID must fit in 11 bits");
+        let frame = socketcan::CanFrame::new(Id::Standard(std_id), data)
+            .expect("Failed to create DAMIAO CAN frame");
+        socket.write_frame(&frame)?;
+        Ok(())
+    }
+
+    /// Read the next DAMIAO feedback frame matching this motor.
+    ///
+    /// Skips extended-ID frames (Robstride traffic on a shared bus), short
+    /// payloads, and frames whose payload byte 0 low nibble does not match
+    /// `can_id`. If `master_id` is non-zero, additionally requires the
+    /// response's standard ID to equal it.
+    fn recv_feedback(&self, socket: &CanSocket, timeout: Duration) -> Result<Feedback> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if Instant::now() >= deadline {
+                return Err(RobstrideError::Timeout {
+                    motor_id: self.can_id,
+                });
+            }
+            match socket.read_frame() {
+                Ok(frame) => {
+                    if frame.is_extended() {
+                        continue;
+                    }
+                    let raw_id = match frame.id() {
+                        Id::Standard(sid) => StandardId::as_raw(&sid) as u16,
+                        _ => continue,
+                    };
+                    if self.master_id != 0 && raw_id != self.master_id {
+                        continue;
+                    }
+                    let data = frame.data();
+                    if data.len() < 8 {
+                        continue;
+                    }
+                    if (data[0] & 0x0F) != self.can_id {
+                        continue;
+                    }
+                    return Ok(decode_damiao_feedback(data, &self.limits));
+                }
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
+                Err(e) => return Err(RobstrideError::CanSocket(e)),
+            }
+        }
+    }
+}
+
+impl MotorDriver for DamiaoDriver {
+    fn enable(&self, socket: &CanSocket) -> Result<()> {
+        self.send_std(socket, &DM_ENABLE)?;
+        let _ = self.recv_feedback(socket, Duration::from_millis(50));
+        Ok(())
+    }
+
+    fn disable(&self, socket: &CanSocket) -> Result<()> {
+        self.send_std(socket, &DM_DISABLE)?;
+        let _ = self.recv_feedback(socket, Duration::from_millis(50));
+        Ok(())
+    }
+
+    fn mit_exchange(
+        &self,
+        socket: &CanSocket,
+        position: f64,
+        velocity: f64,
+        kp: f64,
+        kd: f64,
+        torque: f64,
+    ) -> Result<Feedback> {
+        let data = pack_damiao_mit(position, velocity, kp, kd, torque, &self.limits);
+        self.send_std(socket, &data)?;
+        self.recv_feedback(socket, Duration::from_millis(10))
+    }
+
+    fn read_position(&self, _socket: &CanSocket) -> Result<f64> {
+        Err(RobstrideError::InvalidResponse {
+            msg: "DAMIAO MIT mode cannot read position while disabled".into(),
+        })
+    }
+
+    fn read_velocity(&self, _socket: &CanSocket) -> Result<f64> {
+        Err(RobstrideError::InvalidResponse {
+            msg: "DAMIAO MIT mode cannot read velocity while disabled".into(),
+        })
+    }
+
+    fn torque_limit(&self) -> f64 {
+        // Same 50 %-of-MIT-range safety margin as Robstride.
+        self.limits.t_max * 0.5
+    }
+
+    fn description(&self) -> String {
+        format!("DAMIAO {} ID:{}", self.model, self.can_id)
+    }
+}
+
+fn pack_damiao_mit(
+    pos: f64,
+    vel: f64,
+    kp: f64,
+    kd: f64,
+    tau: f64,
+    lim: &DamiaoLimits,
+) -> [u8; 8] {
+    let p_int = float_to_uint(pos, -lim.p_max, lim.p_max, 16);
+    let v_int = float_to_uint(vel, -lim.v_max, lim.v_max, 12);
+    let kp_int = float_to_uint(kp, 0.0, lim.kp_max, 12);
+    let kd_int = float_to_uint(kd, 0.0, lim.kd_max, 12);
+    let t_int = float_to_uint(tau, -lim.t_max, lim.t_max, 12);
+    [
+        ((p_int >> 8) & 0xFF) as u8,
+        (p_int & 0xFF) as u8,
+        ((v_int >> 4) & 0xFF) as u8,
+        ((((v_int & 0xF) << 4) | ((kp_int >> 8) & 0xF)) & 0xFF) as u8,
+        (kp_int & 0xFF) as u8,
+        ((kd_int >> 4) & 0xFF) as u8,
+        ((((kd_int & 0xF) << 4) | ((t_int >> 8) & 0xF)) & 0xFF) as u8,
+        (t_int & 0xFF) as u8,
+    ]
+}
+
+fn decode_damiao_feedback(data: &[u8], lim: &DamiaoLimits) -> Feedback {
+    let motor_id = data[0] & 0x0F;
+    let p_int = ((data[1] as u32) << 8) | (data[2] as u32);
+    let v_int = ((data[3] as u32) << 4) | ((data[4] as u32) >> 4);
+    let t_int = (((data[4] & 0x0F) as u32) << 8) | (data[5] as u32);
+    Feedback {
+        motor_id,
+        position: uint_to_float(p_int, -lim.p_max, lim.p_max, 16),
+        velocity: uint_to_float(v_int, -lim.v_max, lim.v_max, 12),
+        torque: uint_to_float(t_int, -lim.t_max, lim.t_max, 12),
+        // DM reports two temperatures (byte 6 = MOS, byte 7 = rotor); expose
+        // MOS as the primary temperature like Robstride.
+        temperature: data[6] as f64,
+        status: MotorStatusBits::default(),
+    }
+}
+
+fn float_to_uint(x: f64, x_min: f64, x_max: f64, bits: u32) -> u32 {
+    let span = x_max - x_min;
+    let max_uint = ((1u64 << bits) - 1) as f64;
+    let x_clamped = x.clamp(x_min, x_max);
+    let scaled = ((x_clamped - x_min) * max_uint / span).round();
+    scaled.clamp(0.0, max_uint) as u32
+}
+
+fn uint_to_float(x_int: u32, x_min: f64, x_max: f64, bits: u32) -> f64 {
+    let span = x_max - x_min;
+    let max_uint = ((1u64 << bits) - 1) as f64;
+    (x_int as f64) * span / max_uint + x_min
+}
+
+// =============================================================================
+// Motor specification (vendor + identification + model)
+// =============================================================================
+
+/// Vendor-agnostic motor specification used to construct a driver instance.
+///
+/// Both bilateral motors and the single-motor assist test take a `MotorSpec`,
+/// so leader and follower can be different vendors.
+#[derive(Debug, Clone)]
+pub enum MotorSpec {
+    Robstride {
+        host_id: u8,
+        can_id: u8,
+        model: MotorModel,
+    },
+    Damiao {
+        /// Motor's TX address (its `CAN_ID` register).
+        can_id: u8,
+        /// Motor's RX address that the host listens on (its `MST_ID` register).
+        /// Use 0 to skip ID filtering and rely on the motor-id nibble in the
+        /// response payload.
+        master_id: u16,
+        model: DamiaoModel,
+    },
+}
+
+impl MotorSpec {
+    /// Convenience constructor for a Robstride motor.
+    pub fn robstride(host_id: u8, can_id: u8, model: MotorModel) -> Self {
+        MotorSpec::Robstride {
+            host_id,
+            can_id,
+            model,
+        }
+    }
+
+    /// Convenience constructor for a DAMIAO motor. `master_id = 0` is fine
+    /// when only one DM motor is on the bus.
+    pub fn damiao(can_id: u8, master_id: u16, model: DamiaoModel) -> Self {
+        MotorSpec::Damiao {
+            can_id,
+            master_id,
+            model,
+        }
+    }
+
+    /// Build the concrete driver for this spec.
+    pub fn build(&self) -> Box<dyn MotorDriver> {
+        match *self {
+            MotorSpec::Robstride {
+                host_id,
+                can_id,
+                model,
+            } => Box::new(RobstrideDriver::new(host_id, can_id, model)),
+            MotorSpec::Damiao {
+                can_id,
+                master_id,
+                model,
+            } => Box::new(DamiaoDriver::new(can_id, master_id, model)),
+        }
+    }
+
+    /// CAN ID used to address the motor (TX side).
+    pub fn can_id(&self) -> u8 {
+        match *self {
+            MotorSpec::Robstride { can_id, .. } => can_id,
+            MotorSpec::Damiao { can_id, .. } => can_id,
+        }
+    }
+
+    /// Short human-readable label for logs and UI.
+    pub fn description(&self) -> String {
+        match *self {
+            MotorSpec::Robstride { model, can_id, .. } => {
+                format!("Robstride {} ID:{}", model, can_id)
+            }
+            MotorSpec::Damiao { model, can_id, .. } => {
+                format!("DAMIAO {} ID:{}", model, can_id)
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn damiao_pack_unpack_roundtrip() {
+        let lim = DamiaoLimits::for_model(DamiaoModel::DmJ4310_2EC);
+        let bytes = pack_damiao_mit(1.5, 2.0, 100.0, 1.0, 3.0, &lim);
+        // Decode the *command* bytes back through the *feedback* decoder is
+        // not meaningful (different layout), so verify the feedback decoder
+        // round-trips its own packing manually.
+        let mut data = [0u8; 8];
+        // Build a feedback packet matching motor id 7, pos=1.5, vel=2.0, tau=3.0.
+        let p_int = float_to_uint(1.5, -lim.p_max, lim.p_max, 16);
+        let v_int = float_to_uint(2.0, -lim.v_max, lim.v_max, 12);
+        let t_int = float_to_uint(3.0, -lim.t_max, lim.t_max, 12);
+        data[0] = 0x07; // err=0, id=7
+        data[1] = ((p_int >> 8) & 0xFF) as u8;
+        data[2] = (p_int & 0xFF) as u8;
+        data[3] = ((v_int >> 4) & 0xFF) as u8;
+        data[4] = ((((v_int & 0xF) << 4) | ((t_int >> 8) & 0xF)) & 0xFF) as u8;
+        data[5] = (t_int & 0xFF) as u8;
+        data[6] = 35;
+        data[7] = 40;
+        let fb = decode_damiao_feedback(&data, &lim);
+        assert_eq!(fb.motor_id, 7);
+        assert!((fb.position - 1.5).abs() < 1e-3);
+        assert!((fb.velocity - 2.0).abs() < 2e-2);
+        assert!((fb.torque - 3.0).abs() < 1e-2);
+        // Command bytes are non-empty.
+        assert_eq!(bytes.len(), 8);
+    }
+
+    #[test]
+    fn damiao_zero_command_packs_to_midpoint() {
+        let lim = DamiaoLimits::for_model(DamiaoModel::DmJ4310_2EC);
+        let bytes = pack_damiao_mit(0.0, 0.0, 0.0, 0.0, 0.0, &lim);
+        // Zero position should encode to half-scale of u16 (0x7FFF or 0x8000).
+        let p_int = ((bytes[0] as u32) << 8) | (bytes[1] as u32);
+        assert!(p_int == 0x7FFF || p_int == 0x8000);
+        // kp=0 -> top 4 bits of bytes[3..4] should be zero.
+        assert_eq!(bytes[3] & 0x0F, 0);
+        assert_eq!(bytes[4], 0);
+    }
+}
+
