@@ -25,25 +25,31 @@ use robstride_sandbox::protocol::{MotorFeedback, MotorModel, ParamIndex, RunMode
 /// sync with [`parse_motor_kind`].
 const MOTOR_KIND_CHOICES: &str = "rs00|rs01|rs02|rs03|rs04|rs05|rs06|dm4310";
 
-/// Parse a motor-kind string (as shown in the param choice list) into a
-/// [`MotorSpec`]. Falls back to Robstride with `default_model` if `kind` is
-/// unrecognised; a non-numeric `id` falls back to `default_id`.
+/// Parse a motor-kind string into a [`MotorSpec`].
+///
+/// Returns `(spec, warning)`. `warning` is `Some(msg)` if `kind` was not
+/// recognised; the caller should surface this to the user instead of silently
+/// using the fallback Robstride spec.
 fn parse_motor_kind(
     kind: &str,
     id_str: &str,
     default_id: u8,
     host_id: u8,
     default_model: MotorModel,
-) -> MotorSpec {
+) -> (MotorSpec, Option<String>) {
     let id: u8 = id_str.parse().unwrap_or(default_id);
     if let Some(model) = MotorModel::from_str(kind) {
-        return MotorSpec::robstride(host_id, id, model);
+        return (MotorSpec::robstride(host_id, id, model), None);
     }
     if let Some(model) = DamiaoModel::from_str_ci(kind) {
         // master_id = 0 means "match any standard ID, filter by payload nibble".
-        return MotorSpec::damiao(id, 0, model);
+        return (MotorSpec::damiao(id, 0, model), None);
     }
-    MotorSpec::robstride(host_id, id, default_model)
+    let warn = format!(
+        "Unknown motor kind '{}', falling back to Robstride {} (choices: {})",
+        kind, default_model, MOTOR_KIND_CHOICES
+    );
+    (MotorSpec::robstride(host_id, id, default_model), Some(warn))
 }
 
 const APP_NAME: &str = "robstride_sandbox";
@@ -904,13 +910,14 @@ impl App {
         let parts: Vec<&str> = input.trim().split_whitespace().collect();
         let get = |i: usize| parts.get(i).copied();
 
-        let motor = parse_motor_kind(
+        let (motor, motor_warn) = parse_motor_kind(
             get(0).unwrap_or("rs05"),
             get(1).unwrap_or("10"),
             10,
             self.host_id,
             self.default_model,
         );
+        if let Some(w) = motor_warn { self.log_msg(w); }
         let mut cfg = AssistTestConfig {
             interface: self.interface.clone(),
             motor,
@@ -960,20 +967,22 @@ impl App {
         let parts: Vec<&str> = input.trim().split_whitespace().collect();
         let get = |i: usize| parts.get(i).copied();
 
-        let leader = parse_motor_kind(
+        let (leader, leader_warn) = parse_motor_kind(
             get(0).unwrap_or("rs05"),
             get(1).unwrap_or("10"),
             10,
             self.host_id,
             self.default_model,
         );
-        let follower = parse_motor_kind(
+        if let Some(w) = leader_warn { self.log_msg(format!("Leader: {}", w)); }
+        let (follower, follower_warn) = parse_motor_kind(
             get(2).unwrap_or("rs05"),
             get(3).unwrap_or("1"),
             1,
             self.host_id,
             self.default_model,
         );
+        if let Some(w) = follower_warn { self.log_msg(format!("Follower: {}", w)); }
 
         let method_str = get(4).unwrap_or("coupling");
         let method = match BilateralMethod::from_short(method_str) {
