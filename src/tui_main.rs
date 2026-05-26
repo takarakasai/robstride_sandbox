@@ -17,7 +17,7 @@ use ratatui::widgets::*;
 use serde::{Deserialize, Serialize};
 
 use robstride_sandbox::bilateral::{self, AssistTestConfig, BilateralConfig, BilateralGains, BilateralMethod, SharedTelemetry, StopFlag};
-use robstride_sandbox::driver::{DamiaoModel, MotorSpec};
+use robstride_sandbox::driver::{self, DamiaoModel, MotorSpec};
 use socketcan::{CanSocket, Socket};
 use robstride_sandbox::motor::Motor;
 use robstride_sandbox::protocol::{MotorFeedback, MotorModel, ParamIndex, RunMode};
@@ -170,6 +170,8 @@ fn params_for_command(cmd: Command) -> Vec<ParamField> {
         Command::Scan => vec![
             ParamField::new("from", "1", "Start ID [1-254]"),
             ParamField::new("to", "127", "End ID [1-254]"),
+            ParamField::with_choices("vendor", "rs", "Vendor to probe (rs=Robstride, dm=DAMIAO, both)",
+                "rs|dm|both"),
         ],
         Command::ReadParam => vec![
             ParamField::with_choices("param", "mech_pos", "Parameter name",
@@ -374,6 +376,9 @@ struct App {
     /// Set by Zero Pair, applied at Bilateral / Assist Test launch.
     /// Lives in-memory only — never written to motor NVM or to disk.
     soft_zero_offsets: HashMap<String, f64>,
+    /// If `vendor=both` was selected, the DAMIAO scan to run synchronously
+    /// once the (async) Robstride scan finishes. Cleared after firing.
+    dm_scan_after: Option<(u8, u8)>,
 }
 
 impl App {
@@ -412,6 +417,7 @@ impl App {
             param_edit_buf: String::new(),
             config,
             soft_zero_offsets: HashMap::new(),
+            dm_scan_after: None,
         }
     }
 
@@ -448,60 +454,98 @@ impl App {
             return;
         }
 
-        // Parse range from input
+        // Parse range + vendor from input. Params: from to vendor
         let parts: Vec<&str> = input.trim().split_whitespace().collect();
-        let from: u8 = if !parts.is_empty() {
-            parts[0].parse().unwrap_or(1)
-        } else {
-            1
-        };
-        let to: u8 = if parts.len() > 1 {
-            parts[1].parse().unwrap_or(127)
-        } else {
-            127
-        };
+        let from: u8 = parts.first().and_then(|s| s.parse().ok()).unwrap_or(1);
+        let to: u8 = parts.get(1).and_then(|s| s.parse().ok()).unwrap_or(127);
+        let vendor = parts.get(2).copied().unwrap_or("rs").to_lowercase();
         let from = from.max(1);
         let to = to.max(from).min(254);
 
-        self.log_msg(format!("Scanning CAN bus ID {}..={}...", from, to));
-
-        // Reset progress
-        {
-            let mut progress = self.scan_progress.lock().unwrap();
-            *progress = (0, (to - from + 1) as usize, true);
-        }
-        {
-            let mut results = self.scan_results.lock().unwrap();
-            results.clear();
+        let do_rs = vendor == "rs" || vendor == "both";
+        let do_dm = vendor == "dm" || vendor == "both";
+        if !do_rs && !do_dm {
+            self.log_msg(format!(
+                "Unknown vendor '{}'. Use rs, dm, or both.",
+                vendor
+            ));
+            return;
         }
 
-        // Launch scan in background thread
-        let interface = self.interface.clone();
-        let host_id = self.host_id;
-        let progress = Arc::clone(&self.scan_progress);
-        let results_out = Arc::clone(&self.scan_results);
-
-        std::thread::spawn(move || {
-            let results = Motor::scan_bus_progressive(
-                &interface,
-                host_id,
-                from..=to,
-                Duration::from_millis(100),
-                |current, total, _motor_id| {
-                    if let Ok(mut p) = progress.lock() {
-                        p.0 = current;
-                        p.1 = total;
-                    }
-                },
-            );
-
-            if let Ok(mut out) = results_out.lock() {
-                *out = results;
+        // Robstride scan runs asynchronously (slow per-ID timeout); DAMIAO
+        // scan is short (~10ms per ID, ~1 s for 1..127) so it runs inline
+        // after the async scan completes (via self.dm_scan_after).
+        if do_rs {
+            self.log_msg(format!(
+                "Scanning CAN bus (Robstride) ID {}..={}...",
+                from, to
+            ));
+            {
+                let mut progress = self.scan_progress.lock().unwrap();
+                *progress = (0, (to - from + 1) as usize, true);
             }
-            if let Ok(mut p) = progress.lock() {
-                p.2 = false; // scanning done
+            {
+                let mut results = self.scan_results.lock().unwrap();
+                results.clear();
             }
-        });
+            let interface = self.interface.clone();
+            let host_id = self.host_id;
+            let progress = Arc::clone(&self.scan_progress);
+            let results_out = Arc::clone(&self.scan_results);
+            std::thread::spawn(move || {
+                let results = Motor::scan_bus_progressive(
+                    &interface,
+                    host_id,
+                    from..=to,
+                    Duration::from_millis(100),
+                    |current, total, _motor_id| {
+                        if let Ok(mut p) = progress.lock() {
+                            p.0 = current;
+                            p.1 = total;
+                        }
+                    },
+                );
+                if let Ok(mut out) = results_out.lock() {
+                    *out = results;
+                }
+                if let Ok(mut p) = progress.lock() {
+                    p.2 = false;
+                }
+            });
+            // Queue the DM scan to run when the Robstride scan finishes.
+            self.dm_scan_after = if do_dm { Some((from, to)) } else { None };
+        } else if do_dm {
+            // DM-only scan: run inline (synchronous, ~1 s).
+            self.run_damiao_scan(from, to);
+        }
+    }
+
+    /// Synchronous DAMIAO scan probe. Logs found IDs.
+    fn run_damiao_scan(&mut self, from: u8, to: u8) {
+        self.log_msg(format!(
+            "Scanning CAN bus (DAMIAO) ID {}..={} (probe takes ~10 ms/ID)...",
+            from, to
+        ));
+        match driver::scan_damiao(&self.interface, from..=to, Duration::from_millis(10)) {
+            Ok(ids) => {
+                if ids.is_empty() {
+                    self.log_msg("No DAMIAO motors found.".to_string());
+                } else {
+                    let pretty: Vec<String> =
+                        ids.iter().map(|i| format!("{} (0x{:02X})", i, i)).collect();
+                    self.log_msg(format!(
+                        "Found {} DAMIAO motor(s): {}",
+                        ids.len(),
+                        pretty.join(", ")
+                    ));
+                    self.log_msg(
+                        "  Use these IDs in Bilateral with lead_kind/foll_kind=dm4310."
+                            .to_string(),
+                    );
+                }
+            }
+            Err(e) => self.log_msg(format!("DAMIAO scan error: {}", e)),
+        }
     }
 
     /// Check if a background scan has completed and process results.
@@ -551,6 +595,11 @@ impl App {
                 }
             }
             self.motors.sort_by_key(|m| m.id);
+        }
+
+        // If "both" was requested, the DAMIAO scan was queued to follow.
+        if let Some((from, to)) = self.dm_scan_after.take() {
+            self.run_damiao_scan(from, to);
         }
     }
 

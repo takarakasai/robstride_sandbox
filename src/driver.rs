@@ -541,6 +541,80 @@ impl MotorDriver for DamiaoDriver {
     }
 }
 
+/// Discover DAMIAO motors on the bus.
+///
+/// For each `can_id` in `range`, sends a DM enable frame and listens briefly
+/// for a status response. Any motor that answers is reported. Each probed ID
+/// is immediately followed by a DM disable frame so found motors don't stay
+/// powered (they receive no MIT command between enable and disable, so no
+/// torque is ever commanded).
+///
+/// Returns the IDs that answered, in ascending order.
+pub fn scan_damiao(
+    interface: &str,
+    range: std::ops::RangeInclusive<u8>,
+    per_id_timeout: Duration,
+) -> Result<Vec<u8>> {
+    let socket = CanSocket::open(interface)?;
+    socket.set_read_timeout(per_id_timeout)?;
+
+    // Drain any frames already in the socket buffer so they don't
+    // contaminate the very first probe.
+    while let Ok(_) = socket.read_frame_timeout(Duration::from_millis(1)) {}
+
+    let mut found = Vec::new();
+    for can_id in range {
+        let std_id = match StandardId::new(can_id as u16) {
+            Some(id) => id,
+            None => continue,
+        };
+        let enable_frame = socketcan::CanFrame::new(Id::Standard(std_id), &DM_ENABLE)
+            .expect("8-byte DM_ENABLE fits a CAN data frame");
+        if socket.write_frame(&enable_frame).is_err() {
+            continue;
+        }
+
+        // Wait for a standard-ID frame whose payload byte-0 low nibble
+        // matches this CAN_ID's low nibble (DM motor-id field).
+        let deadline = Instant::now() + per_id_timeout;
+        let mut answered = false;
+        loop {
+            if Instant::now() >= deadline {
+                break;
+            }
+            match socket.read_frame() {
+                Ok(frame) => {
+                    if frame.is_extended() {
+                        continue;
+                    }
+                    let data = frame.data();
+                    if data.len() < 8 {
+                        continue;
+                    }
+                    if (data[0] & 0x0F) == (can_id & 0x0F) {
+                        answered = true;
+                        break;
+                    }
+                }
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
+                Err(_) => break,
+            }
+        }
+        if answered {
+            found.push(can_id);
+        }
+
+        // Always send disable so a responding motor returns to safe state.
+        let disable_frame = socketcan::CanFrame::new(Id::Standard(std_id), &DM_DISABLE)
+            .expect("8-byte DM_DISABLE fits a CAN data frame");
+        let _ = socket.write_frame(&disable_frame);
+        // Tiny gap so the motor processes the disable before the next probe.
+        std::thread::sleep(Duration::from_millis(2));
+    }
+
+    Ok(found)
+}
+
 fn pack_damiao_mit(
     pos: f64,
     vel: f64,
