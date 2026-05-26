@@ -387,7 +387,11 @@ impl DamiaoDriver {
                     if data.len() < 8 {
                         continue;
                     }
-                    if (data[0] & 0x0F) != self.can_id {
+                    // The motor-id nibble in byte 0 is only the LOW 4 bits of
+                    // the motor's CAN_ID, so compare nibbles, not full IDs.
+                    // For CAN_IDs that share a low nibble, distinguish via
+                    // master_id (the response standard ID) instead.
+                    if (data[0] & 0x0F) != (self.can_id & 0x0F) {
                         continue;
                     }
                     return Ok(decode_damiao_feedback(data, &self.limits));
