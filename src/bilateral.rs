@@ -297,6 +297,15 @@ pub struct BilateralConfig {
     /// assist-loop positive feedback / vendor sign mismatch / etc. before
     /// the joint hits a hard mechanical stop.
     pub safety_radius: f64,
+    /// Maximum allowed position change between consecutive samples [rad].
+    /// Catches "motor was driven uncontrolled during a CAN dropout" — when
+    /// frames are missed under high-rate motion the loop sees prev_pos stuck
+    /// at the last good value and the next fresh frame can show the motor
+    /// already saturated at ±p_max. Physically a DM-J4310 maxes at ~30 rad/s,
+    /// so at a 500 Hz loop the max plausible jump is ~0.06 rad. Default 0.5
+    /// rad gives ample slack while still catching multi-rad jumps. Set 0 to
+    /// disable.
+    pub safety_max_jump: f64,
 }
 
 impl Default for BilateralConfig {
@@ -310,6 +319,7 @@ impl Default for BilateralConfig {
             gains: BilateralGains::default(),
             loop_period_us: 2000, // 500 Hz target
             safety_radius: std::f64::consts::PI,
+            safety_max_jump: 0.5,
         }
     }
 }
@@ -573,6 +583,27 @@ fn run_bilateral_loop(
             }
         };
 
+        // Jump watchdog: catch the case where CAN dropouts kept prev_*
+        // frozen while the motor was physically accelerating, so by the time
+        // a fresh frame arrives the position has already moved into a
+        // dangerous regime. Skip on cycle 0 — prev_* was seeded from the
+        // pre-loop initial exchange and the very first iteration's delta is
+        // meaningless if the read timed out then.
+        if cycle > 0 && config.safety_max_jump > 0.0 {
+            let dl = (fb_l.position - prev_l_pos).abs();
+            let df = (fb_f.position - prev_f_pos).abs();
+            if dl > config.safety_max_jump || df > config.safety_max_jump {
+                if let Ok(mut t) = telemetry.lock() {
+                    t.last_error = Some(format!(
+                        "SAFETY: position jumped > {:.2} rad/cycle (leader Δ={:.3}, follower Δ={:.3}) — \
+                         likely CAN dropout under motion; disabling",
+                        config.safety_max_jump, dl, df,
+                    ));
+                }
+                break;
+            }
+        }
+
         prev_l_pos = fb_l.position;
         prev_l_vel = fb_l.velocity;
         prev_f_pos = fb_f.position;
@@ -758,6 +789,22 @@ fn run_ondemand_loop(
         let tau_follower_est = mit_kp_f * (l_pos - fb_f.position)
             + mit_kd_f * (l_vel - fb_f.velocity)
             + tau_ff_f;
+
+        // Jump watchdog (see run_bilateral_loop for rationale).
+        if cycle > 0 && config.safety_max_jump > 0.0 {
+            let dl = (l_pos - prev_l_pos).abs();
+            let df = (fb_f.position - _prev_f_pos).abs();
+            if dl > config.safety_max_jump || df > config.safety_max_jump {
+                if let Ok(mut t) = telemetry.lock() {
+                    t.last_error = Some(format!(
+                        "SAFETY: position jumped > {:.2} rad/cycle (leader Δ={:.3}, follower Δ={:.3}) — \
+                         likely CAN dropout under motion; disabling",
+                        config.safety_max_jump, dl, df,
+                    ));
+                }
+                break;
+            }
+        }
 
         _prev_f_pos = fb_f.position;
         prev_f_vel = fb_f.velocity;

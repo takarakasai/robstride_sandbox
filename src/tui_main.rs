@@ -1320,6 +1320,7 @@ impl App {
             gains,
             loop_period_us: 2000,
             safety_radius,
+            safety_max_jump: 0.5,
         };
 
         self.log_msg(format!(
