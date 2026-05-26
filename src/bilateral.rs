@@ -370,8 +370,8 @@ fn run_bilateral_loop(
     let socket = CanSocket::open(&config.interface)?;
     socket.set_read_timeout(Duration::from_millis(10))?;
 
-    let leader = config.leader.build();
-    let follower = config.follower.build();
+    let mut leader = config.leader.build();
+    let mut follower = config.follower.build();
 
     // Enable both motors
     leader.enable(&socket)?;
@@ -649,8 +649,8 @@ fn run_ondemand_loop(
     let socket = CanSocket::open(&config.interface)?;
     socket.set_read_timeout(Duration::from_millis(10))?;
 
-    let leader = config.leader.build();
-    let follower = config.follower.build();
+    let mut leader = config.leader.build();
+    let mut follower = config.follower.build();
 
     // Leader starts DISABLED (free to backdrive)
     let _ = leader.disable(&socket);
@@ -917,7 +917,7 @@ fn run_assist_test_loop(
     let socket = CanSocket::open(&config.interface)?;
     socket.set_read_timeout(Duration::from_millis(10))?;
 
-    let motor = config.motor.build();
+    let mut motor = config.motor.build();
 
     // Enable motor
     motor.enable(&socket)?;

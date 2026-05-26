@@ -369,6 +369,10 @@ struct App {
     param_edit_buf: String,
     /// Persistent user config (saved to disk)
     config: AppConfig,
+    /// Soft-zero offsets, keyed by MotorSpec::key().
+    /// Set by Zero Pair, applied at Bilateral / Assist Test launch.
+    /// Lives in-memory only — never written to motor NVM or to disk.
+    soft_zero_offsets: HashMap<String, f64>,
 }
 
 impl App {
@@ -406,6 +410,7 @@ impl App {
             editing_param: false,
             param_edit_buf: String::new(),
             config,
+            soft_zero_offsets: HashMap::new(),
         }
     }
 
@@ -930,6 +935,7 @@ impl App {
             self.default_model,
         );
         if let Some(w) = motor_warn { self.log_msg(w); }
+        let motor = self.apply_saved_offset(motor);
         let mut cfg = AssistTestConfig {
             interface: self.interface.clone(),
             motor,
@@ -964,9 +970,10 @@ impl App {
     }
 
     /// Zero both the leader and follower at their current physical positions.
-    /// Run with both joints held at the desired neutral pose before starting
-    /// bilateral control, otherwise the initial position error will yank both
-    /// motors.
+    /// The zero is held in-memory inside the App (does NOT write to motor
+    /// NVM) and re-applied when Bilateral / Assist Test is launched.
+    /// Run with both joints held at the desired neutral pose; otherwise the
+    /// initial position error will yank both motors.
     fn execute_zero_pair(&mut self, input: &str) {
         if self.bilateral_stop.is_some() {
             self.log_msg("Bilateral loop is running; stop it first.".to_string());
@@ -976,7 +983,7 @@ impl App {
         let parts: Vec<&str> = input.trim().split_whitespace().collect();
         let get = |i: usize| parts.get(i).copied();
 
-        let (leader, lw) = parse_motor_kind(
+        let (leader_spec, lw) = parse_motor_kind(
             get(0).unwrap_or("rs05"),
             get(1).unwrap_or("10"),
             10,
@@ -984,7 +991,7 @@ impl App {
             self.default_model,
         );
         if let Some(w) = lw { self.log_msg(format!("Leader: {}", w)); }
-        let (follower, fw) = parse_motor_kind(
+        let (follower_spec, fw) = parse_motor_kind(
             get(2).unwrap_or("rs05"),
             get(3).unwrap_or("1"),
             1,
@@ -1004,15 +1011,28 @@ impl App {
             self.log_msg(format!("Set read timeout failed: {}", e));
         }
 
-        let lead = leader.build();
-        let foll = follower.build();
-        match lead.set_zero(&socket) {
-            Ok(()) => self.log_msg(format!("Zero set: {}", lead.description())),
-            Err(e) => self.log_msg(format!("Zero set {} failed: {}", lead.description(), e)),
+        for spec in [&leader_spec, &follower_spec] {
+            let mut drv = spec.build();
+            let label = spec.description();
+            match drv.set_soft_zero(&socket) {
+                Ok(()) => {
+                    let offset = drv.soft_zero_offset();
+                    self.soft_zero_offsets.insert(spec.key(), offset);
+                    self.log_msg(format!(
+                        "Soft zero set: {} (offset = {:.4} rad, in-memory only)",
+                        label, offset
+                    ));
+                }
+                Err(e) => self.log_msg(format!("Soft zero {} failed: {}", label, e)),
+            }
         }
-        match foll.set_zero(&socket) {
-            Ok(()) => self.log_msg(format!("Zero set: {}", foll.description())),
-            Err(e) => self.log_msg(format!("Zero set {} failed: {}", foll.description(), e)),
+    }
+
+    /// Attach the saved soft-zero offset (if any) to `spec`.
+    fn apply_saved_offset(&self, spec: MotorSpec) -> MotorSpec {
+        match self.soft_zero_offsets.get(&spec.key()).copied() {
+            Some(offset) => spec.with_soft_zero(offset),
+            None => spec,
         }
     }
 
@@ -1040,6 +1060,7 @@ impl App {
             self.default_model,
         );
         if let Some(w) = leader_warn { self.log_msg(format!("Leader: {}", w)); }
+        let leader = self.apply_saved_offset(leader);
         let (follower, follower_warn) = parse_motor_kind(
             get(2).unwrap_or("rs05"),
             get(3).unwrap_or("1"),
@@ -1048,6 +1069,7 @@ impl App {
             self.default_model,
         );
         if let Some(w) = follower_warn { self.log_msg(format!("Follower: {}", w)); }
+        let follower = self.apply_saved_offset(follower);
 
         let method_str = get(4).unwrap_or("coupling");
         let method = match BilateralMethod::from_short(method_str) {

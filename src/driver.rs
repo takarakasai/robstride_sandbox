@@ -27,24 +27,42 @@ pub type Feedback = MotorFeedback;
 ///
 /// Drivers must be `Send` because the bilateral control loop runs in a
 /// dedicated thread and takes ownership of two boxed drivers.
+///
+/// All driver methods take `&mut self` because each driver carries a
+/// soft-zero offset that is mutated by [`MotorDriver::set_soft_zero`] and
+/// read by [`MotorDriver::mit_exchange`].
 pub trait MotorDriver: Send {
     /// Enable the motor (allow torque output).
-    fn enable(&self, socket: &CanSocket) -> Result<()>;
+    fn enable(&mut self, socket: &CanSocket) -> Result<()>;
 
     /// Disable the motor (free-spin / zero output).
-    fn disable(&self, socket: &CanSocket) -> Result<()>;
+    fn disable(&mut self, socket: &CanSocket) -> Result<()>;
 
-    /// Latch the current physical position as the motor's zero reference.
-    /// On both vendors this persists to NVM and survives power cycles.
-    /// Must be issued with the joint held physically at the desired neutral.
-    fn set_zero(&self, socket: &CanSocket) -> Result<()>;
+    /// Latch the current physical position as the in-memory zero reference.
+    ///
+    /// **Does not touch motor NVM** — the offset lives only inside this
+    /// driver instance, so calibration must be re-done after a process
+    /// restart. The motor is briefly enabled and immediately disabled to
+    /// read its current position (all MIT gains kept at zero so no torque
+    /// is commanded).
+    fn set_soft_zero(&mut self, socket: &CanSocket) -> Result<()>;
+
+    /// Current soft-zero offset [rad].
+    fn soft_zero_offset(&self) -> f64;
+
+    /// Set the soft-zero offset directly (for restoring from a saved
+    /// session value without re-running [`MotorDriver::set_soft_zero`]).
+    fn set_soft_zero_offset(&mut self, offset: f64);
 
     /// Send one MIT-mode command frame and return the resulting feedback.
     ///
     /// `position` [rad], `velocity` [rad/s], `kp` [Nm/rad], `kd` [Nm·s/rad],
-    /// `torque` [Nm] — all in physical units; the driver scales them.
+    /// `torque` [Nm] — all in physical units; the driver scales them and
+    /// applies the soft-zero offset (so callers see a coordinate frame
+    /// where the zero point is wherever [`MotorDriver::set_soft_zero`] was
+    /// invoked).
     fn mit_exchange(
-        &self,
+        &mut self,
         socket: &CanSocket,
         position: f64,
         velocity: f64,
@@ -55,11 +73,13 @@ pub trait MotorDriver: Send {
 
     /// Read mechanical position [rad]. Must work while the motor is disabled
     /// (used by the OnDemand bilateral method to keep the leader free).
-    fn read_position(&self, socket: &CanSocket) -> Result<f64>;
+    /// The returned value is already soft-zero-adjusted.
+    fn read_position(&mut self, socket: &CanSocket) -> Result<f64>;
 
     /// Read mechanical velocity [rad/s]. Same disabled-read requirement as
-    /// [`MotorDriver::read_position`].
-    fn read_velocity(&self, socket: &CanSocket) -> Result<f64>;
+    /// [`MotorDriver::read_position`]. Velocity is unaffected by the soft
+    /// zero (it's a derivative quantity).
+    fn read_velocity(&mut self, socket: &CanSocket) -> Result<f64>;
 
     /// Safe output torque limit [Nm] used by the bilateral loop for clamping.
     /// Implementations should already include any safety margin they want
@@ -120,6 +140,7 @@ pub struct RobstrideDriver {
     motor_id: u8,
     model: MotorModel,
     scales: MitScales,
+    soft_zero: f64,
 }
 
 impl RobstrideDriver {
@@ -129,6 +150,7 @@ impl RobstrideDriver {
             motor_id,
             model,
             scales: MitScales::for_model(model),
+            soft_zero: 0.0,
         }
     }
 
@@ -140,7 +162,7 @@ impl RobstrideDriver {
         self.model
     }
 
-    fn read_param(&self, socket: &CanSocket, param: ParamIndex) -> Result<f32> {
+    fn read_param(&mut self, socket: &CanSocket, param: ParamIndex) -> Result<f32> {
         let (can_id, data) = build_read_param_frame(self.host_id, self.motor_id, param);
         send_can(socket, can_id, &data)?;
         let deadline = Instant::now() + Duration::from_millis(20);
@@ -157,7 +179,7 @@ impl RobstrideDriver {
 }
 
 impl MotorDriver for RobstrideDriver {
-    fn enable(&self, socket: &CanSocket) -> Result<()> {
+    fn enable(&mut self, socket: &CanSocket) -> Result<()> {
         let (can_id, data) = build_enable_frame(self.host_id, self.motor_id);
         send_can(socket, can_id, &data)?;
         // Consume the response frame if it arrives; ignore timeout.
@@ -165,22 +187,27 @@ impl MotorDriver for RobstrideDriver {
         Ok(())
     }
 
-    fn disable(&self, socket: &CanSocket) -> Result<()> {
+    fn disable(&mut self, socket: &CanSocket) -> Result<()> {
         let (can_id, data) = build_disable_frame(self.host_id, self.motor_id);
         send_can(socket, can_id, &data)?;
         let _ = recv_can(socket, Duration::from_millis(50));
         Ok(())
     }
 
-    fn set_zero(&self, socket: &CanSocket) -> Result<()> {
-        let (can_id, data) = build_set_zero_frame(self.host_id, self.motor_id);
-        send_can(socket, can_id, &data)?;
-        let _ = recv_can(socket, Duration::from_millis(50));
-        Ok(())
+    fn set_soft_zero(&mut self, socket: &CanSocket) -> Result<()> {
+        soft_zero_via_mit(self, socket)
+    }
+
+    fn soft_zero_offset(&self) -> f64 {
+        self.soft_zero
+    }
+
+    fn set_soft_zero_offset(&mut self, offset: f64) {
+        self.soft_zero = offset;
     }
 
     fn mit_exchange(
-        &self,
+        &mut self,
         socket: &CanSocket,
         position: f64,
         velocity: f64,
@@ -188,11 +215,13 @@ impl MotorDriver for RobstrideDriver {
         kd: f64,
         torque: f64,
     ) -> Result<Feedback> {
+        // Apply soft-zero on the way out so the user's "0 rad" command lands
+        // at the physical position captured at soft-zero time.
         let (can_id, data) = build_mit_frame(
             self.host_id,
             self.motor_id,
             &self.scales,
-            position,
+            position + self.soft_zero,
             velocity,
             kp,
             kd,
@@ -209,8 +238,9 @@ impl MotorDriver for RobstrideDriver {
             let (ct, extra, dev, rdata) = recv_can(socket, timeout)?;
             if ct == CommType::OperationStatus as u8 {
                 let raw = build_can_id_raw(ct, extra, dev);
-                if let Some(fb) = parse_status_frame(raw, &rdata, &self.scales) {
+                if let Some(mut fb) = parse_status_frame(raw, &rdata, &self.scales) {
                     if fb.motor_id == self.motor_id {
+                        fb.position -= self.soft_zero;
                         return Ok(fb);
                     }
                 }
@@ -218,11 +248,12 @@ impl MotorDriver for RobstrideDriver {
         }
     }
 
-    fn read_position(&self, socket: &CanSocket) -> Result<f64> {
-        Ok(self.read_param(socket, ParamIndex::MechPos)? as f64)
+    fn read_position(&mut self, socket: &CanSocket) -> Result<f64> {
+        let raw = self.read_param(socket, ParamIndex::MechPos)? as f64;
+        Ok(raw - self.soft_zero)
     }
 
-    fn read_velocity(&self, socket: &CanSocket) -> Result<f64> {
+    fn read_velocity(&mut self, socket: &CanSocket) -> Result<f64> {
         Ok(self.read_param(socket, ParamIndex::MechVel)? as f64)
     }
 
@@ -233,6 +264,24 @@ impl MotorDriver for RobstrideDriver {
     fn description(&self) -> String {
         format!("Robstride {} ID:{}", self.model, self.motor_id)
     }
+}
+
+/// Shared soft-zero logic for any driver that can read its current position
+/// via an MIT-zero exchange while enabled. Resets the existing offset first
+/// so the read returns the raw physical position, then stores that as the
+/// new offset.
+fn soft_zero_via_mit<D: MotorDriver + ?Sized>(driver: &mut D, socket: &CanSocket) -> Result<()> {
+    driver.set_soft_zero_offset(0.0);
+    driver.enable(socket)?;
+    // Brief settle so the motor is ready to report state.
+    std::thread::sleep(Duration::from_millis(10));
+    let fb_result = driver.mit_exchange(socket, 0.0, 0.0, 0.0, 0.0, 0.0);
+    // Always disable, even if the read failed, to avoid leaving the motor
+    // hot.
+    let _ = driver.disable(socket);
+    let fb = fb_result?;
+    driver.set_soft_zero_offset(fb.position);
+    Ok(())
 }
 
 // =============================================================================
@@ -265,7 +314,9 @@ impl MotorDriver for RobstrideDriver {
 
 const DM_ENABLE: [u8; 8] = [0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFC];
 const DM_DISABLE: [u8; 8] = [0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFD];
-const DM_SET_ZERO: [u8; 8] = [0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFE];
+// Note: the DAMIAO 0xFE "set zero" magic frame writes to motor NVM; we
+// intentionally do not send it. Soft zero is implemented as an in-memory
+// offset inside the driver — see `soft_zero_via_mit`.
 
 /// DAMIAO motor model.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -341,6 +392,7 @@ pub struct DamiaoDriver {
     master_id: u16,
     model: DamiaoModel,
     limits: DamiaoLimits,
+    soft_zero: f64,
 }
 
 impl DamiaoDriver {
@@ -350,6 +402,7 @@ impl DamiaoDriver {
             master_id,
             model,
             limits: DamiaoLimits::for_model(model),
+            soft_zero: 0.0,
         }
     }
 
@@ -361,7 +414,7 @@ impl DamiaoDriver {
         self.model
     }
 
-    fn send_std(&self, socket: &CanSocket, data: &[u8]) -> Result<()> {
+    fn send_std(&mut self, socket: &CanSocket, data: &[u8]) -> Result<()> {
         let std_id = StandardId::new(self.can_id as u16)
             .expect("DAMIAO CAN_ID must fit in 11 bits");
         let frame = socketcan::CanFrame::new(Id::Standard(std_id), data)
@@ -376,7 +429,7 @@ impl DamiaoDriver {
     /// payloads, and frames whose payload byte 0 low nibble does not match
     /// `can_id`. If `master_id` is non-zero, additionally requires the
     /// response's standard ID to equal it.
-    fn recv_feedback(&self, socket: &CanSocket, timeout: Duration) -> Result<Feedback> {
+    fn recv_feedback(&mut self, socket: &CanSocket, timeout: Duration) -> Result<Feedback> {
         let deadline = Instant::now() + timeout;
         loop {
             if Instant::now() >= deadline {
@@ -417,28 +470,34 @@ impl DamiaoDriver {
 }
 
 impl MotorDriver for DamiaoDriver {
-    fn enable(&self, socket: &CanSocket) -> Result<()> {
+    fn enable(&mut self, socket: &CanSocket) -> Result<()> {
         self.send_std(socket, &DM_ENABLE)?;
         let _ = self.recv_feedback(socket, Duration::from_millis(50));
         Ok(())
     }
 
-    fn disable(&self, socket: &CanSocket) -> Result<()> {
+    fn disable(&mut self, socket: &CanSocket) -> Result<()> {
         self.send_std(socket, &DM_DISABLE)?;
         let _ = self.recv_feedback(socket, Duration::from_millis(50));
         Ok(())
     }
 
-    fn set_zero(&self, socket: &CanSocket) -> Result<()> {
-        // DM saves the zero-offset to NVM, which can take ~10 ms; give the
-        // motor a longer window to respond than we do for enable/disable.
-        self.send_std(socket, &DM_SET_ZERO)?;
-        let _ = self.recv_feedback(socket, Duration::from_millis(100));
-        Ok(())
+    fn set_soft_zero(&mut self, socket: &CanSocket) -> Result<()> {
+        // In-memory only; the DM_SET_ZERO magic frame (FF..FE) deliberately
+        // is *not* sent here, since that would write to motor NVM.
+        soft_zero_via_mit(self, socket)
+    }
+
+    fn soft_zero_offset(&self) -> f64 {
+        self.soft_zero
+    }
+
+    fn set_soft_zero_offset(&mut self, offset: f64) {
+        self.soft_zero = offset;
     }
 
     fn mit_exchange(
-        &self,
+        &mut self,
         socket: &CanSocket,
         position: f64,
         velocity: f64,
@@ -446,18 +505,27 @@ impl MotorDriver for DamiaoDriver {
         kd: f64,
         torque: f64,
     ) -> Result<Feedback> {
-        let data = pack_damiao_mit(position, velocity, kp, kd, torque, &self.limits);
+        let data = pack_damiao_mit(
+            position + self.soft_zero,
+            velocity,
+            kp,
+            kd,
+            torque,
+            &self.limits,
+        );
         self.send_std(socket, &data)?;
-        self.recv_feedback(socket, Duration::from_millis(10))
+        let mut fb = self.recv_feedback(socket, Duration::from_millis(10))?;
+        fb.position -= self.soft_zero;
+        Ok(fb)
     }
 
-    fn read_position(&self, _socket: &CanSocket) -> Result<f64> {
+    fn read_position(&mut self, _socket: &CanSocket) -> Result<f64> {
         Err(RobstrideError::InvalidResponse {
             msg: "DAMIAO MIT mode cannot read position while disabled".into(),
         })
     }
 
-    fn read_velocity(&self, _socket: &CanSocket) -> Result<f64> {
+    fn read_velocity(&mut self, _socket: &CanSocket) -> Result<f64> {
         Err(RobstrideError::InvalidResponse {
             msg: "DAMIAO MIT mode cannot read velocity while disabled".into(),
         })
@@ -536,13 +604,16 @@ fn uint_to_float(x_int: u32, x_min: f64, x_max: f64, bits: u32) -> f64 {
 /// Vendor-agnostic motor specification used to construct a driver instance.
 ///
 /// Both bilateral motors and the single-motor assist test take a `MotorSpec`,
-/// so leader and follower can be different vendors.
+/// so leader and follower can be different vendors. `soft_zero` is the
+/// in-memory offset to seed the driver with at build time (see
+/// [`MotorDriver::set_soft_zero_offset`]); use 0.0 for a fresh motor.
 #[derive(Debug, Clone)]
 pub enum MotorSpec {
     Robstride {
         host_id: u8,
         can_id: u8,
         model: MotorModel,
+        soft_zero: f64,
     },
     Damiao {
         /// Motor's TX address (its `CAN_ID` register).
@@ -552,6 +623,7 @@ pub enum MotorSpec {
         /// response payload.
         master_id: u16,
         model: DamiaoModel,
+        soft_zero: f64,
     },
 }
 
@@ -562,6 +634,7 @@ impl MotorSpec {
             host_id,
             can_id,
             model,
+            soft_zero: 0.0,
         }
     }
 
@@ -572,22 +645,42 @@ impl MotorSpec {
             can_id,
             master_id,
             model,
+            soft_zero: 0.0,
         }
     }
 
-    /// Build the concrete driver for this spec.
+    /// Return a copy of this spec with the soft-zero offset replaced.
+    pub fn with_soft_zero(mut self, offset: f64) -> Self {
+        match &mut self {
+            MotorSpec::Robstride { soft_zero, .. } => *soft_zero = offset,
+            MotorSpec::Damiao { soft_zero, .. } => *soft_zero = offset,
+        }
+        self
+    }
+
+    /// Build the concrete driver for this spec, seeded with `soft_zero`.
     pub fn build(&self) -> Box<dyn MotorDriver> {
         match *self {
             MotorSpec::Robstride {
                 host_id,
                 can_id,
                 model,
-            } => Box::new(RobstrideDriver::new(host_id, can_id, model)),
+                soft_zero,
+            } => {
+                let mut d = RobstrideDriver::new(host_id, can_id, model);
+                d.set_soft_zero_offset(soft_zero);
+                Box::new(d)
+            }
             MotorSpec::Damiao {
                 can_id,
                 master_id,
                 model,
-            } => Box::new(DamiaoDriver::new(can_id, master_id, model)),
+                soft_zero,
+            } => {
+                let mut d = DamiaoDriver::new(can_id, master_id, model);
+                d.set_soft_zero_offset(soft_zero);
+                Box::new(d)
+            }
         }
     }
 
@@ -596,6 +689,19 @@ impl MotorSpec {
         match *self {
             MotorSpec::Robstride { can_id, .. } => can_id,
             MotorSpec::Damiao { can_id, .. } => can_id,
+        }
+    }
+
+    /// Stable identifier suitable for keying offsets / per-motor state across
+    /// driver instances. Format: `<vendor>:<model>:<id>`.
+    pub fn key(&self) -> String {
+        match *self {
+            MotorSpec::Robstride { model, can_id, .. } => {
+                format!("robstride:{}:{}", model, can_id)
+            }
+            MotorSpec::Damiao { model, can_id, .. } => {
+                format!("damiao:{}:{}", model, can_id)
+            }
         }
     }
 
