@@ -974,6 +974,7 @@ impl App {
             follower_id: 1,
             model: self.default_model,
             method,
+            ondemand: false,
             gains,
             loop_period_us: 2000,
         };

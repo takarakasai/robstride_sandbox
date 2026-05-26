@@ -17,10 +17,11 @@ use std::sync::{
 };
 use std::time::{Duration, Instant};
 
-use socketcan::{CanSocket, EmbeddedFrame, ExtendedId, Id, Socket};
+use socketcan::{CanSocket, Socket};
 
-use crate::error::{Result, RobstrideError};
-use crate::protocol::*;
+use crate::driver::{MotorDriver, RobstrideDriver};
+use crate::error::Result;
+use crate::protocol::MotorModel;
 
 // =============================================================================
 // Types
@@ -193,113 +194,14 @@ pub type SharedTelemetry = Arc<Mutex<BilateralTelemetry>>;
 pub type StopFlag = Arc<AtomicBool>;
 
 // =============================================================================
-// Low-level CAN helpers (thread-local, no Motor struct dependency)
+// Driver construction
 // =============================================================================
+//
+// Concrete CAN protocol details live in [`crate::driver`]. The bilateral loops
+// only see a `Box<dyn MotorDriver>` per motor.
 
-fn send_can(socket: &CanSocket, can_id: u32, data: &[u8]) -> Result<()> {
-    let ext_id = ExtendedId::new(can_id).expect("Invalid extended CAN ID");
-    let frame = socketcan::CanFrame::new(ext_id, data).expect("Failed to create CAN frame");
-    socket.write_frame(&frame)?;
-    Ok(())
-}
-
-fn recv_can(socket: &CanSocket, timeout: Duration) -> Result<(u8, u16, u8, Vec<u8>)> {
-    let start = Instant::now();
-    loop {
-        if start.elapsed() > timeout {
-            return Err(RobstrideError::Timeout { motor_id: 0 });
-        }
-        match socket.read_frame() {
-            Ok(frame) => {
-                if !frame.is_extended() {
-                    continue;
-                }
-                let raw_id = match frame.id() {
-                    Id::Standard(sid) => socketcan::StandardId::as_raw(&sid) as u32,
-                    Id::Extended(eid) => ExtendedId::as_raw(&eid),
-                };
-                let data = frame.data().to_vec();
-                let (comm_type, extra_data, device_id) = parse_can_id(raw_id);
-                return Ok((comm_type, extra_data, device_id, data));
-            }
-            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
-            Err(e) => return Err(RobstrideError::CanSocket(e)),
-        }
-    }
-}
-
-/// Send MIT command and receive feedback for one motor.
-fn mit_exchange(
-    socket: &CanSocket,
-    host_id: u8,
-    motor_id: u8,
-    scales: &MitScales,
-    position: f64,
-    velocity: f64,
-    kp: f64,
-    kd: f64,
-    torque: f64,
-) -> Result<MotorFeedback> {
-    let (can_id, data) = build_mit_frame(host_id, motor_id, scales, position, velocity, kp, kd, torque);
-    send_can(socket, can_id, &data)?;
-
-    // Read response, skip echo / unrelated frames
-    let deadline = Instant::now() + Duration::from_millis(10);
-    loop {
-        let (ct, extra, dev, rdata) = recv_can(socket, deadline.duration_since(Instant::now()).max(Duration::from_millis(1)))?;
-        if ct == CommType::OperationStatus as u8 {
-            let raw = build_can_id_raw(ct, extra, dev);
-            if let Some(fb) = parse_status_frame(raw, &rdata, scales) {
-                if fb.motor_id == motor_id {
-                    return Ok(fb);
-                }
-            }
-        }
-    }
-}
-
-/// Enable a motor via CAN (does not use Motor struct).
-fn can_enable(socket: &CanSocket, host_id: u8, motor_id: u8) -> Result<()> {
-    let (can_id, data) = build_enable_frame(host_id, motor_id);
-    send_can(socket, can_id, &data)?;
-    // consume response
-    let _ = recv_can(socket, Duration::from_millis(50));
-    Ok(())
-}
-
-/// Disable a motor via CAN.
-fn can_disable(socket: &CanSocket, host_id: u8, motor_id: u8) -> Result<()> {
-    let (can_id, data) = build_disable_frame(host_id, motor_id);
-    send_can(socket, can_id, &data)?;
-    let _ = recv_can(socket, Duration::from_millis(50));
-    Ok(())
-}
-
-/// Read current iq_filt from a motor.
-#[allow(dead_code)]
-fn can_read_current(socket: &CanSocket, host_id: u8, motor_id: u8) -> Result<f32> {
-    let (can_id, data) = build_read_param_frame(host_id, motor_id, ParamIndex::IqFilt);
-    send_can(socket, can_id, &data)?;
-    let deadline = Instant::now() + Duration::from_millis(20);
-    loop {
-        let (_ct, _extra, _dev, rdata) = recv_can(socket, deadline.duration_since(Instant::now()).max(Duration::from_millis(1)))?;
-        if let Some((_idx, val)) = parse_param_response(&rdata) {
-            return Ok(val);
-        }
-    }
-}
-
-/// Read a single float parameter from a motor (works even when disabled).
-fn can_read_param(socket: &CanSocket, host_id: u8, motor_id: u8, param: ParamIndex) -> Result<f32> {
-    let (can_id, data) = build_read_param_frame(host_id, motor_id, param);
-    send_can(socket, can_id, &data)?;
-    let deadline = Instant::now() + Duration::from_millis(20);
-    loop {
-        let (_ct, _extra, _dev, rdata) = recv_can(socket, deadline.duration_since(Instant::now()).max(Duration::from_millis(1)))?;
-        if let Some((_idx, val)) = parse_param_response(&rdata) {
-            return Ok(val);
-        }
-    }
+fn make_driver(host_id: u8, motor_id: u8, model: MotorModel) -> Box<dyn MotorDriver> {
+    Box::new(RobstrideDriver::new(host_id, motor_id, model))
 }
 
 // =============================================================================
@@ -472,20 +374,18 @@ fn run_bilateral_loop(
     let socket = CanSocket::open(&config.interface)?;
     socket.set_read_timeout(Duration::from_millis(10))?;
 
-    let scales = MitScales::for_model(config.model);
-    let host = config.host_id;
-    let lid = config.leader_id;
-    let fid = config.follower_id;
+    let leader = make_driver(config.host_id, config.leader_id, config.model);
+    let follower = make_driver(config.host_id, config.follower_id, config.model);
 
     // Enable both motors
-    can_enable(&socket, host, lid)?;
+    leader.enable(&socket)?;
     std::thread::sleep(Duration::from_millis(20));
-    can_enable(&socket, host, fid)?;
+    follower.enable(&socket)?;
     std::thread::sleep(Duration::from_millis(20));
 
     // Initial status read (MIT zero command)
-    let fb_l = mit_exchange(&socket, host, lid, &scales, 0.0, 0.0, 0.0, 0.0, 0.0)?;
-    let fb_f = mit_exchange(&socket, host, fid, &scales, 0.0, 0.0, 0.0, 0.0, 0.0)?;
+    let fb_l = leader.mit_exchange(&socket, 0.0, 0.0, 0.0, 0.0, 0.0)?;
+    let fb_f = follower.mit_exchange(&socket, 0.0, 0.0, 0.0, 0.0, 0.0)?;
 
     let mut prev_l_pos = fb_l.position;
     let mut prev_f_pos = fb_f.position;
@@ -515,8 +415,10 @@ fn run_bilateral_loop(
     let mut leader_prev_vel = prev_l_vel;
     let mut accel_lpf = LowPassFilter::new(config.gains.accel_cutoff);
 
-    // Clamp torque to motor limits
-    let torque_limit = scales.torque * 0.5; // leave 50% margin for safety
+    // Per-motor torque clamps (50 % of model scale is already applied by the
+    // Robstride driver; other vendors apply their own margin).
+    let leader_torque_limit = leader.torque_limit();
+    let follower_torque_limit = follower.torque_limit();
     let start_time = Instant::now();
 
     loop {
@@ -601,8 +503,9 @@ fn run_bilateral_loop(
         let tau_follower_total = tau_follower + friction_comp_f * ramp;
 
         // Clamp
-        let tau_leader_clamped = tau_leader_total.clamp(-torque_limit, torque_limit);
-        let tau_follower_clamped = tau_follower_total.clamp(-torque_limit, torque_limit);
+        let tau_leader_clamped = tau_leader_total.clamp(-leader_torque_limit, leader_torque_limit);
+        let tau_follower_clamped =
+            tau_follower_total.clamp(-follower_torque_limit, follower_torque_limit);
 
         // =====================================================================
         // Leader: use motor-internal kd for velocity assist
@@ -646,9 +549,8 @@ fn run_bilateral_loop(
         };
 
         // Send MIT commands
-        let fb_l = match mit_exchange(
-            &socket, host, lid, &scales,
-            0.0, mit_vel_leader, 0.0, mit_kd_leader, tau_leader_clamped,
+        let fb_l = match leader.mit_exchange(
+            &socket, 0.0, mit_vel_leader, 0.0, mit_kd_leader, tau_leader_clamped,
         ) {
             Ok(fb) => fb,
             Err(_e) => {
@@ -658,9 +560,8 @@ fn run_bilateral_loop(
             }
         };
 
-        let fb_f = match mit_exchange(
-            &socket, host, fid, &scales,
-            0.0, 0.0, 0.0, 0.0, tau_follower_clamped,
+        let fb_f = match follower.mit_exchange(
+            &socket, 0.0, 0.0, 0.0, 0.0, tau_follower_clamped,
         ) {
             Ok(fb) => fb,
             Err(_e) => {
@@ -727,8 +628,8 @@ fn run_bilateral_loop(
     }
 
     // Disable both motors on exit
-    let _ = can_disable(&socket, host, lid);
-    let _ = can_disable(&socket, host, fid);
+    let _ = leader.disable(&socket);
+    let _ = follower.disable(&socket);
 
     Ok(())
 }
@@ -752,25 +653,23 @@ fn run_ondemand_loop(
     let socket = CanSocket::open(&config.interface)?;
     socket.set_read_timeout(Duration::from_millis(10))?;
 
-    let scales = MitScales::for_model(config.model);
-    let host = config.host_id;
-    let lid = config.leader_id;
-    let fid = config.follower_id;
+    let leader = make_driver(config.host_id, config.leader_id, config.model);
+    let follower = make_driver(config.host_id, config.follower_id, config.model);
 
     // Leader starts DISABLED (free to backdrive)
-    let _ = can_disable(&socket, host, lid);
+    let _ = leader.disable(&socket);
     std::thread::sleep(Duration::from_millis(20));
 
     // Follower enabled in MIT mode
-    can_enable(&socket, host, fid)?;
+    follower.enable(&socket)?;
     std::thread::sleep(Duration::from_millis(20));
 
     // Read initial leader position via param read
-    let l_pos_init = can_read_param(&socket, host, lid, ParamIndex::MechPos)? as f64;
-    let l_vel_init = can_read_param(&socket, host, lid, ParamIndex::MechVel)? as f64;
+    let l_pos_init = leader.read_position(&socket)?;
+    let l_vel_init = leader.read_velocity(&socket)?;
 
     // Follower initial status (MIT zero)
-    let fb_f = mit_exchange(&socket, host, fid, &scales, 0.0, 0.0, 0.0, 0.0, 0.0)?;
+    let fb_f = follower.mit_exchange(&socket, 0.0, 0.0, 0.0, 0.0, 0.0)?;
 
     let mut prev_l_pos = l_pos_init;
     let mut prev_l_vel = l_vel_init;
@@ -786,7 +685,8 @@ fn run_ondemand_loop(
     let viscous = config.gains.viscous_friction;
     let loop_period = Duration::from_micros(config.loop_period_us);
 
-    let torque_limit = scales.torque * 0.5;
+    let leader_torque_limit = leader.torque_limit();
+    let follower_torque_limit = follower.torque_limit();
 
     let mut leader_enabled = false;
     let mut cycle: u64 = 0;
@@ -809,15 +709,9 @@ fn run_ondemand_loop(
         };
         loop_start = iter_start;
 
-        // --- Read leader position (param read, works when disabled) ---
-        let l_pos = match can_read_param(&socket, host, lid, ParamIndex::MechPos) {
-            Ok(v) => v as f64,
-            Err(_) => prev_l_pos, // keep previous on timeout
-        };
-        let l_vel = match can_read_param(&socket, host, lid, ParamIndex::MechVel) {
-            Ok(v) => v as f64,
-            Err(_) => prev_l_vel,
-        };
+        // --- Read leader position (works when disabled) ---
+        let l_pos = leader.read_position(&socket).unwrap_or(prev_l_pos);
+        let l_vel = leader.read_velocity(&socket).unwrap_or(prev_l_vel);
         prev_l_pos = l_pos;
         prev_l_vel = l_vel;
 
@@ -827,11 +721,10 @@ fn run_ondemand_loop(
         let mit_kp_f = kp * ramp;
         let mit_kd_f = kd * ramp;
         let friction_comp_f = friction_compensation(prev_f_vel, coulomb, viscous) * ramp;
-        let tau_ff_f = friction_comp_f.clamp(-torque_limit, torque_limit);
+        let tau_ff_f = friction_comp_f.clamp(-follower_torque_limit, follower_torque_limit);
 
-        let fb_f = match mit_exchange(
-            &socket, host, fid, &scales,
-            l_pos, l_vel, mit_kp_f, mit_kd_f, tau_ff_f,
+        let fb_f = match follower.mit_exchange(
+            &socket, l_pos, l_vel, mit_kp_f, mit_kd_f, tau_ff_f,
         ) {
             Ok(fb) => fb,
             Err(_) => {
@@ -863,7 +756,7 @@ fn run_ondemand_loop(
 
         if !leader_enabled && !opening && follower_force > force_threshold {
             // Contact detected -> enable leader for force feedback
-            can_enable(&socket, host, lid)?;
+            leader.enable(&socket)?;
             std::thread::sleep(Duration::from_millis(5));
             leader_enabled = true;
         }
@@ -871,7 +764,7 @@ fn run_ondemand_loop(
         if leader_enabled {
             if follower_force < force_threshold * 0.5 {
                 // Contact released -> disable leader (free again)
-                let _ = can_disable(&socket, host, lid);
+                let _ = leader.disable(&socket);
                 leader_enabled = false;
             } else {
                 // --- Leader: torque reflection from follower ---
@@ -883,10 +776,9 @@ fn run_ondemand_loop(
                 // The follower is tracking leader at 10kHz (MIT internal kp/kd),
                 // so fb_f.torque accurately represents the environment reaction.
                 tau_leader_cmd = (-force_scale * fb_f.torque * ramp)
-                    .clamp(-torque_limit, torque_limit);
-                let fb_l = match mit_exchange(
-                    &socket, host, lid, &scales,
-                    0.0, 0.0, 0.0, 0.0, tau_leader_cmd,
+                    .clamp(-leader_torque_limit, leader_torque_limit);
+                let fb_l = match leader.mit_exchange(
+                    &socket, 0.0, 0.0, 0.0, 0.0, tau_leader_cmd,
                 ) {
                     Ok(fb) => fb,
                     Err(_) => {
@@ -940,8 +832,8 @@ fn run_ondemand_loop(
     }
 
     // Disable both motors on exit
-    let _ = can_disable(&socket, host, lid);
-    let _ = can_disable(&socket, host, fid);
+    let _ = leader.disable(&socket);
+    let _ = follower.disable(&socket);
 
     Ok(())
 }
@@ -1033,16 +925,14 @@ fn run_assist_test_loop(
     let socket = CanSocket::open(&config.interface)?;
     socket.set_read_timeout(Duration::from_millis(10))?;
 
-    let scales = MitScales::for_model(config.model);
-    let host = config.host_id;
-    let mid = config.motor_id;
+    let motor = make_driver(config.host_id, config.motor_id, config.model);
 
     // Enable motor
-    can_enable(&socket, host, mid)?;
+    motor.enable(&socket)?;
     std::thread::sleep(Duration::from_millis(20));
 
     // Initial status read
-    let fb = mit_exchange(&socket, host, mid, &scales, 0.0, 0.0, 0.0, 0.0, 0.0)?;
+    let fb = motor.mit_exchange(&socket, 0.0, 0.0, 0.0, 0.0, 0.0)?;
     let mut prev_vel = fb.velocity;
     let mut prev_prev_vel = prev_vel;
 
@@ -1057,7 +947,7 @@ fn run_assist_test_loop(
     let mut hz_accum = 0.0;
     let mut hz_count = 0u32;
 
-    let torque_limit = scales.torque * 0.5; // leave 50% margin for safety
+    let torque_limit = motor.torque_limit();
     let start_time = Instant::now();
 
     loop {
@@ -1118,9 +1008,8 @@ fn run_assist_test_loop(
         };
 
         // Send MIT command
-        let fb = match mit_exchange(
-            &socket, host, mid, &scales,
-            0.0, mit_vel, 0.0, mit_kd, tau_ff,
+        let fb = match motor.mit_exchange(
+            &socket, 0.0, mit_vel, 0.0, mit_kd, tau_ff,
         ) {
             Ok(fb) => fb,
             Err(_e) => {
@@ -1165,6 +1054,6 @@ fn run_assist_test_loop(
         }
     }
 
-    let _ = can_disable(&socket, host, mid);
+    let _ = motor.disable(&socket);
     Ok(())
 }
