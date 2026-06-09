@@ -597,6 +597,26 @@ fn run_bilateral_loop(
     let mut spurious_count: u32 = 0;
     const MAX_SPURIOUS_BEFORE_TRIP: u32 = 20;
 
+    // Startup sign-integrity check. Coupling methods are *attractive*: a
+    // correctly wired leader/follower pair should converge toward each
+    // other when nobody is touching them. If the leader/follower inversion
+    // flags (lead_inv / foll_inv) are wrong, the same coupling torque
+    // *pushes* them apart — the position error grows after the soft-start
+    // gain hits 1.0. We snapshot the initial error here and re-check once
+    // the ramp completes; if the error has grown substantially while both
+    // motors are essentially still, we emit a one-shot warning telling the
+    // operator to flip an inversion. We don't bail — the safety_radius
+    // watchdog will catch true runaways — because false positives are
+    // possible if the operator is intentionally holding the leader.
+    let initial_pos_err = (fb_l.position - fb_f.position).abs();
+    let mut sign_check_done = match config.method {
+        // Only meaningful for methods with mutual attraction.
+        BilateralMethod::VirtualCoupling
+        | BilateralMethod::ModeSpace
+        | BilateralMethod::VirtualCouplingMit => false,
+        _ => true,
+    };
+
     loop {
         if stop.load(Ordering::Relaxed) {
             break;
@@ -604,6 +624,37 @@ fn run_bilateral_loop(
 
         let iter_start = Instant::now();
         let ramp = soft_start_gain(start_time.elapsed().as_secs_f64());
+
+        // One-shot sign-integrity check: fires the first cycle after
+        // soft-start is complete. See declaration of `sign_check_done` for
+        // rationale. Requires both motors to be essentially still (so we
+        // don't misread an operator actively pulling them apart as a sign
+        // error) and the *current* error to be both absolutely large and
+        // a substantial fraction larger than the initial snapshot.
+        if !sign_check_done && ramp >= 1.0 {
+            sign_check_done = true;
+            const STILL_VEL_THRESHOLD: f64 = 1.0; // rad/s
+            const ABS_GROWTH_THRESHOLD: f64 = 0.3; // rad
+            const REL_GROWTH_FACTOR: f64 = 2.0;
+            let current_err = (prev_l_pos - prev_f_pos).abs();
+            let both_still =
+                prev_l_vel.abs() < STILL_VEL_THRESHOLD
+                    && prev_f_vel.abs() < STILL_VEL_THRESHOLD;
+            let grew = current_err
+                > initial_pos_err * REL_GROWTH_FACTOR + ABS_GROWTH_THRESHOLD;
+            if both_still && grew {
+                if let Ok(mut t) = telemetry.lock() {
+                    t.last_error = Some(format!(
+                        "[WARN] Possible sign mismatch: position error grew from \
+                         {:.3} to {:.3} rad while both motors idle after soft-start. \
+                         Coupling appears repulsive — try flipping foll_inv or lead_inv \
+                         in the bilateral config, or re-run 'Zero Pair'.",
+                        initial_pos_err, current_err,
+                    ));
+                }
+            }
+        }
+
         let dt = if cycle == 0 {
             loop_period.as_secs_f64()
         } else {
