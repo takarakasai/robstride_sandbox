@@ -232,7 +232,7 @@ fn params_for_command(cmd: Command) -> Vec<ParamField> {
             ParamField::with_choices("foll_inv", "0", "Follower polarity flip (1 to invert sign)",
                 "0|1"),
             ParamField::with_choices("method", "coupling", "Control method",
-                "pos|force|coupling|mode|ondemand"),
+                "pos|force|coupling|mode|ondemand|ondemand_emu"),
             ParamField::new("kp", "5.0", "Spring stiffness [Nm/rad]"),
             ParamField::new("kd", "0.3", "Damping [Nm·s/rad]"),
             ParamField::new("coulomb", "0.05", "Coulomb friction comp [Nm]"),
@@ -1524,7 +1524,7 @@ impl App {
             Some(m) => m,
             None => {
                 self.log_msg(format!(
-                    "Unknown method '{}'. Use: pos, force, coupling, mode, ondemand",
+                    "Unknown method '{}'. Use: pos, force, coupling, mode, ondemand, ondemand_emu",
                     method_str
                 ));
                 return;
@@ -2321,7 +2321,10 @@ fn render_bilateral_overlay(frame: &mut Frame, app: &App) {
     };
 
     let is_assist_test = telem.method.is_none();
-    let is_ondemand = telem.method == Some(BilateralMethod::OnDemand);
+    let is_ondemand = matches!(
+        telem.method,
+        Some(BilateralMethod::OnDemand | BilateralMethod::EmulatedOnDemand)
+    );
     let method_name = telem
         .method
         .map(|m| m.label())

@@ -1,12 +1,13 @@
 //! Bilateral control implementations for dual-motor haptic teleoperation.
 //!
-//! Five methods are provided:
+//! Six methods are provided:
 //!
 //! 1. **Position Mirroring** – Follower tracks leader position. No force feedback.
 //! 2. **Force-Reflecting** – Follower tracks leader position; leader feels follower reaction force.
 //! 3. **Virtual Coupling** – Symmetric virtual spring-damper between the two motors.
 //! 4. **Mode-Space (4ch)** – Differential/common mode decomposition with observers.
 //! 5. **On-Demand** – Leader stays OFF (free); force-feedback only when follower detects contact.
+//! 6. **Emulated On-Demand** – Leader stays enabled with zero MIT command until contact.
 //!
 //! All methods run a real-time control loop that communicates with two motors
 //! over CAN bus using MIT mode.
@@ -40,15 +41,18 @@ pub enum BilateralMethod {
     ModeSpace,
     /// 5: Leader stays disabled (free); force feedback on follower contact (legacy, use ondemand flag).
     OnDemand,
+    /// 6: Leader stays enabled but outputs ~zero torque until contact.
+    EmulatedOnDemand,
 }
 
 impl BilateralMethod {
-    pub const ALL: [BilateralMethod; 5] = [
+    pub const ALL: [BilateralMethod; 6] = [
         BilateralMethod::PositionMirroring,
         BilateralMethod::ForceReflecting,
         BilateralMethod::VirtualCoupling,
         BilateralMethod::ModeSpace,
         BilateralMethod::OnDemand,
+        BilateralMethod::EmulatedOnDemand,
     ];
 
     pub fn label(&self) -> &'static str {
@@ -58,6 +62,7 @@ impl BilateralMethod {
             BilateralMethod::VirtualCoupling => "Virtual Coupling",
             BilateralMethod::ModeSpace => "Mode Space (4ch)",
             BilateralMethod::OnDemand => "On-Demand",
+            BilateralMethod::EmulatedOnDemand => "Emulated On-Demand",
         }
     }
 
@@ -68,6 +73,7 @@ impl BilateralMethod {
             BilateralMethod::VirtualCoupling => "coupling",
             BilateralMethod::ModeSpace => "mode",
             BilateralMethod::OnDemand => "ondemand",
+            BilateralMethod::EmulatedOnDemand => "ondemand_emu",
         }
     }
 
@@ -79,6 +85,9 @@ impl BilateralMethod {
             "coupling" | "virtual" | "3" => Some(Self::VirtualCoupling),
             "mode" | "4ch" | "4" => Some(Self::ModeSpace),
             "ondemand" | "demand" | "od" | "5" => Some(Self::OnDemand),
+            "ondemand_emu" | "emulated" | "emu" | "eod" | "6" => {
+                Some(Self::EmulatedOnDemand)
+            }
             _ => None,
         }
     }
@@ -363,10 +372,12 @@ pub fn launch_bilateral(
     let stop_flag = Arc::clone(&stop);
 
     std::thread::spawn(move || {
-        let result = if config.method == BilateralMethod::OnDemand {
-            run_ondemand_loop(&config, &telem, &stop_flag)
-        } else {
-            run_bilateral_loop(&config, &telem, &stop_flag)
+        let result = match config.method {
+            BilateralMethod::OnDemand => run_ondemand_loop(&config, &telem, &stop_flag),
+            BilateralMethod::EmulatedOnDemand => {
+                run_emulated_ondemand_loop(&config, &telem, &stop_flag)
+            }
+            _ => run_bilateral_loop(&config, &telem, &stop_flag),
         };
         if let Err(e) = result {
             if let Ok(mut t) = telem.lock() {
@@ -482,6 +493,9 @@ fn run_bilateral_loop(
             }
             BilateralMethod::OnDemand => {
                 unreachable!("OnDemand uses run_ondemand_loop")
+            }
+            BilateralMethod::EmulatedOnDemand => {
+                unreachable!("EmulatedOnDemand uses run_emulated_ondemand_loop")
             }
         };
         // OnDemand gating (all methods except OnDemand legacy)
@@ -913,6 +927,172 @@ fn run_ondemand_loop(
     }
 
     // Disable both motors on exit
+    let _ = leader.disable(&socket);
+    let _ = follower.disable(&socket);
+
+    Ok(())
+}
+
+fn run_emulated_ondemand_loop(
+    config: &BilateralConfig,
+    telemetry: &SharedTelemetry,
+    stop: &StopFlag,
+) -> Result<()> {
+    let socket = CanSocket::open(&config.interface)?;
+    socket.set_read_timeout(Duration::from_millis(10))?;
+
+    let mut leader = config.leader.build();
+    let mut follower = config.follower.build();
+
+    // Emulated free-leader mode: keep leader enabled and command zero MIT
+    // until contact is detected.
+    leader.enable(&socket)?;
+    std::thread::sleep(Duration::from_millis(20));
+    follower.enable(&socket)?;
+    std::thread::sleep(Duration::from_millis(20));
+
+    let fb_l = leader.mit_exchange(&socket, 0.0, 0.0, 0.0, 0.0, 0.0)?;
+    let fb_f = follower.mit_exchange(&socket, 0.0, 0.0, 0.0, 0.0, 0.0)?;
+
+    let mut prev_l_pos = fb_l.position;
+    let mut prev_l_vel = fb_l.velocity;
+    let mut prev_f_vel = fb_f.velocity;
+
+    let kp = config.gains.kp;
+    let kd = config.gains.kd;
+    let force_threshold = config.gains.force_threshold.abs().max(0.01);
+    let force_scale = config.gains.force_scale;
+    let open_sign = config.gains.open_sign;
+    let coulomb = config.gains.coulomb_friction;
+    let viscous = config.gains.viscous_friction;
+    let loop_period = Duration::from_micros(config.loop_period_us);
+
+    let leader_torque_limit = leader.torque_limit();
+    let follower_torque_limit = follower.torque_limit();
+
+    let mut reflect_enabled = false;
+    let mut cycle: u64 = 0;
+    let mut loop_start = Instant::now();
+    let mut hz_accum = 0.0;
+    let mut hz_count = 0u32;
+    let start_time = Instant::now();
+
+    loop {
+        if stop.load(Ordering::Relaxed) {
+            break;
+        }
+
+        let iter_start = Instant::now();
+        let ramp = soft_start_gain(start_time.elapsed().as_secs_f64());
+        let _dt = if cycle == 0 {
+            loop_period.as_secs_f64()
+        } else {
+            iter_start.duration_since(loop_start).as_secs_f64().max(0.0001)
+        };
+        loop_start = iter_start;
+
+        // Follower tracks current leader state.
+        let mit_kp_f = kp * ramp;
+        let mit_kd_f = kd * ramp;
+        let friction_comp_f = friction_compensation(prev_f_vel, coulomb, viscous) * ramp;
+        let tau_ff_f = friction_comp_f.clamp(-follower_torque_limit, follower_torque_limit);
+
+        let fb_f = match follower.mit_exchange(
+            &socket,
+            prev_l_pos,
+            prev_l_vel,
+            mit_kp_f,
+            mit_kd_f,
+            tau_ff_f,
+        ) {
+            Ok(fb) => fb,
+            Err(_) => {
+                cycle += 1;
+                continue;
+            }
+        };
+
+        let tau_follower_est = mit_kp_f * (prev_l_pos - fb_f.position)
+            + mit_kd_f * (prev_l_vel - fb_f.velocity)
+            + tau_ff_f;
+        let follower_force = fb_f.torque.abs();
+
+        let opening = open_sign != 0.0 && (prev_l_vel * open_sign) > 0.1;
+        if !reflect_enabled && !opening && follower_force > force_threshold {
+            reflect_enabled = true;
+        }
+        if reflect_enabled && follower_force < force_threshold * 0.5 {
+            reflect_enabled = false;
+        }
+
+        let tau_leader_cmd = if reflect_enabled {
+            (-force_scale * fb_f.torque * ramp).clamp(-leader_torque_limit, leader_torque_limit)
+        } else {
+            0.0
+        };
+
+        let fb_l = match leader.mit_exchange(&socket, 0.0, 0.0, 0.0, 0.0, tau_leader_cmd) {
+            Ok(fb) => fb,
+            Err(_) => {
+                cycle += 1;
+                continue;
+            }
+        };
+
+        prev_l_pos = fb_l.position;
+        prev_l_vel = fb_l.velocity;
+        prev_f_vel = fb_f.velocity;
+
+        if config.safety_radius > 0.0
+            && (prev_l_pos.abs() > config.safety_radius
+                || fb_f.position.abs() > config.safety_radius)
+        {
+            if let Ok(mut t) = telemetry.lock() {
+                t.last_error = Some(format!(
+                    "SAFETY: |pos| exceeded {:.2} rad (leader={:.3}, follower={:.3}) — disabling",
+                    config.safety_radius, prev_l_pos, fb_f.position,
+                ));
+            }
+            break;
+        }
+
+        let elapsed = iter_start.elapsed().as_secs_f64();
+        if elapsed > 0.0 {
+            hz_accum += 1.0 / elapsed;
+            hz_count += 1;
+        }
+
+        if cycle % 10 == 0 {
+            if let Ok(mut t) = telemetry.lock() {
+                t.leader_pos = prev_l_pos;
+                t.leader_vel = prev_l_vel;
+                t.leader_torque_cmd = tau_leader_cmd;
+                t.follower_pos = fb_f.position;
+                t.follower_vel = fb_f.velocity;
+                t.follower_torque_cmd = tau_follower_est;
+                t.position_error = prev_l_pos - fb_f.position;
+                t.leader_friction_comp = 0.0;
+                t.follower_friction_comp = friction_comp_f;
+                t.leader_inertia_comp = if reflect_enabled { 1.0 } else { 0.0 };
+                t.leader_vel_assist = follower_force;
+                t.cycle_count = cycle;
+                if hz_count > 0 {
+                    t.loop_hz = hz_accum / hz_count as f64;
+                    hz_accum = 0.0;
+                    hz_count = 0;
+                }
+                t.last_error = None;
+            }
+        }
+
+        cycle += 1;
+
+        let work_time = iter_start.elapsed();
+        if work_time < loop_period {
+            std::thread::sleep(loop_period - work_time);
+        }
+    }
+
     let _ = leader.disable(&socket);
     let _ = follower.disable(&socket);
 
