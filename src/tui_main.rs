@@ -22,6 +22,10 @@ use socketcan::{CanSocket, Socket};
 use robstride_sandbox::motor::Motor;
 use robstride_sandbox::protocol::{MotorFeedback, MotorModel, ParamIndex, RunMode};
 
+const DM_MOVE_KP: f64 = 20.0;
+const DM_MOVE_KD: f64 = 1.0;
+const DM_SPIN_KD: f64 = 1.0;
+
 /// Choice string presented to the user for motor kind selection. Keep in
 /// sync with [`parse_motor_kind`].
 const MOTOR_KIND_CHOICES: &str = "rs00|rs01|rs02|rs03|rs04|rs05|rs06|dm4310";
@@ -119,20 +123,6 @@ struct MotorEntry {
 impl MotorEntry {
     fn id(&self) -> u8 {
         self.spec.can_id()
-    }
-
-    /// Robstride-only access tuple (host_id, can_id, model). Returns None for
-    /// DAMIAO entries.
-    fn as_robstride(&self) -> Option<(u8, u8, MotorModel)> {
-        match self.spec {
-            MotorSpec::Robstride {
-                host_id,
-                can_id,
-                model,
-                ..
-            } => Some((host_id, can_id, model)),
-            _ => None,
-        }
     }
 
     /// Short label for the Model column (e.g. "RS-05" or "DM-J4310").
@@ -665,42 +655,64 @@ impl App {
         (ratio, p.2)
     }
 
-    /// Robstride-only access. Returns (host_id, motor_id, model). Logs the
-    /// appropriate warning and returns None when no motor is selected or the
-    /// selected motor is DAMIAO.
-    fn selected_robstride(&mut self) -> Option<(u8, u8, MotorModel)> {
-        let idx = self.selected_motor;
-        let Some(entry) = self.motors.get(idx) else {
-            self.log_msg("No motor selected.".to_string());
-            return None;
-        };
-        match entry.as_robstride() {
-            Some(rs) => Some(rs),
-            None => {
-                let label = entry.spec.description();
-                self.log_msg(format!(
-                    "This command is Robstride-only; selected motor is {}.",
-                    label
-                ));
-                None
-            }
-        }
-    }
-
     fn execute_ping(&mut self) {
-        let Some((host_id, mid, model)) = self.selected_robstride() else { return; };
-        match Motor::new(&self.interface, mid, host_id, model) {
-            Ok(motor) => match motor.ping() {
-                Ok((device_id, uuid)) => {
-                    self.log_msg(format!(
-                        "Ping OK: motor={} device_id=0x{:04X} UUID=[{}]",
-                        mid, device_id, hex_str(&uuid)
-                    ));
-                    self.motors[self.selected_motor].uuid = Some(uuid);
-                }
-                Err(e) => self.log_msg(format!("Ping failed: {}", e)),
+        if self.selected_motor_id().is_none() {
+            self.log_msg("No motor selected.".to_string());
+            return;
+        }
+        let idx = self.selected_motor;
+        let spec = self.motors[idx].spec.clone();
+
+        match spec {
+            MotorSpec::Robstride {
+                host_id,
+                can_id,
+                model,
+                ..
+            } => match Motor::new(&self.interface, can_id, host_id, model) {
+                Ok(motor) => match motor.ping() {
+                    Ok((device_id, uuid)) => {
+                        self.log_msg(format!(
+                            "Ping OK: motor={} device_id=0x{:04X} UUID=[{}]",
+                            can_id,
+                            device_id,
+                            hex_str(&uuid)
+                        ));
+                        self.motors[idx].uuid = Some(uuid);
+                    }
+                    Err(e) => self.log_msg(format!("Ping failed: {}", e)),
+                },
+                Err(e) => self.log_msg(format!("CAN open error: {}", e)),
             },
-            Err(e) => self.log_msg(format!("CAN open error: {}", e)),
+            MotorSpec::Damiao { .. } => {
+                let socket = match CanSocket::open(&self.interface) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        self.log_msg(format!("CAN open error: {}", e));
+                        return;
+                    }
+                };
+                let _ = socket.set_read_timeout(Duration::from_millis(50));
+                let mut driver = self.apply_saved_offset(spec).build();
+                match driver.enable(&socket) {
+                    Ok(()) => {
+                        match driver.mit_exchange(&socket, 0.0, 0.0, 0.0, 0.0, 0.0) {
+                            Ok(fb) => {
+                                self.log_msg(format!(
+                                    "Ping OK (DAMIAO): pos={:.4} vel={:.4} torque={:.4}",
+                                    fb.position, fb.velocity, fb.torque
+                                ));
+                                self.motors[idx].feedback = Some(fb);
+                                self.motors[idx].last_update = Some(Instant::now());
+                                self.motors[idx].error = None;
+                            }
+                            Err(e) => self.log_msg(format!("Ping failed: {}", e)),
+                        }
+                        let _ = driver.disable(&socket);
+                    }
+                    Err(e) => self.log_msg(format!("Ping failed: {}", e)),
+                }
+            }
         }
     }
 
@@ -875,32 +887,86 @@ impl App {
     }
 
     fn execute_read_param(&mut self, input: &str) {
-        let Some(mid) = self.selected_motor_id() else {
+        if self.selected_motor_id().is_none() {
             self.log_msg("No motor selected.".to_string());
             return;
-        };
-        let param = match parse_param_name(input.trim()) {
+        }
+        let idx = self.selected_motor;
+        let spec = self.motors[idx].spec.clone();
+        let name = input.trim().to_lowercase();
+
+        let param = match parse_param_name(&name) {
             Some(p) => p,
             None => {
                 self.log_msg(format!("Unknown param: '{}'. Available: mech_pos, mech_vel, iq_filt, vbus, limit_torque, limit_spd, limit_cur, run_mode, loc_kp, spd_kp, spd_ki", input));
                 return;
             }
         };
-        let Some((host_id, _, model)) = self.selected_robstride() else { return; };
-        match Motor::new(&self.interface, mid, host_id, model) {
-            Ok(motor) => match motor.read_param(param) {
-                Ok(val) => self.log_msg(format!("{} = {:.4}", input.trim(), val)),
-                Err(e) => self.log_msg(format!("Read param failed: {}", e)),
+
+        match spec {
+            MotorSpec::Robstride {
+                host_id,
+                can_id,
+                model,
+                ..
+            } => match Motor::new(&self.interface, can_id, host_id, model) {
+                Ok(motor) => match motor.read_param(param) {
+                    Ok(val) => self.log_msg(format!("{} = {:.4}", input.trim(), val)),
+                    Err(e) => self.log_msg(format!("Read param failed: {}", e)),
+                },
+                Err(e) => self.log_msg(format!("CAN open error: {}", e)),
             },
-            Err(e) => self.log_msg(format!("CAN open error: {}", e)),
+            MotorSpec::Damiao { .. } => {
+                let socket = match CanSocket::open(&self.interface) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        self.log_msg(format!("CAN open error: {}", e));
+                        return;
+                    }
+                };
+                let _ = socket.set_read_timeout(Duration::from_millis(50));
+                let mut driver = self.apply_saved_offset(spec).build();
+                if let Err(e) = driver.enable(&socket) {
+                    self.log_msg(format!("Read param failed: {}", e));
+                    return;
+                }
+                let read_result = driver.mit_exchange(&socket, 0.0, 0.0, 0.0, 0.0, 0.0);
+                let _ = driver.disable(&socket);
+                match read_result {
+                    Ok(fb) => {
+                        let out = match name.as_str() {
+                            "mech_pos" | "position" => Some(fb.position),
+                            "mech_vel" | "velocity" => Some(fb.velocity),
+                            "run_mode" | "mode" => {
+                                self.log_msg(format!("{} = mit", input.trim()));
+                                None
+                            }
+                            _ => {
+                                self.log_msg(format!(
+                                    "DAMIAO read-param '{}' is not available in MIT-only mode",
+                                    input.trim()
+                                ));
+                                None
+                            }
+                        };
+                        if let Some(v) = out {
+                            self.log_msg(format!("{} = {:.4}", input.trim(), v));
+                        }
+                    }
+                    Err(e) => self.log_msg(format!("Read param failed: {}", e)),
+                }
+            }
         }
     }
 
     fn execute_write_param(&mut self, input: &str) {
-        let Some(mid) = self.selected_motor_id() else {
+        if self.selected_motor_id().is_none() {
             self.log_msg("No motor selected.".to_string());
             return;
-        };
+        }
+        let idx = self.selected_motor;
+        let spec = self.motors[idx].spec.clone();
+
         let parts: Vec<&str> = input.trim().split_whitespace().collect();
         if parts.len() != 2 {
             self.log_msg("Usage: name value (e.g. limit_spd 10.0)".to_string());
@@ -920,21 +986,36 @@ impl App {
                 return;
             }
         };
-        let Some((host_id, _, model)) = self.selected_robstride() else { return; };
-        match Motor::new(&self.interface, mid, host_id, model) {
-            Ok(motor) => match motor.write_param_f32(param, value) {
-                Ok(()) => self.log_msg(format!("{} = {:.4} (written)", parts[0], value)),
-                Err(e) => self.log_msg(format!("Write param failed: {}", e)),
+
+        match spec {
+            MotorSpec::Robstride {
+                host_id,
+                can_id,
+                model,
+                ..
+            } => match Motor::new(&self.interface, can_id, host_id, model) {
+                Ok(motor) => match motor.write_param_f32(param, value) {
+                    Ok(()) => self.log_msg(format!("{} = {:.4} (written)", parts[0], value)),
+                    Err(e) => self.log_msg(format!("Write param failed: {}", e)),
+                },
+                Err(e) => self.log_msg(format!("CAN open error: {}", e)),
             },
-            Err(e) => self.log_msg(format!("CAN open error: {}", e)),
+            MotorSpec::Damiao { .. } => {
+                self.log_msg(format!(
+                    "DAMIAO write-param '{}' is not supported in MIT-only mode",
+                    parts[0]
+                ));
+            }
         }
     }
 
     fn execute_set_run_mode(&mut self, input: &str) {
-        let Some(mid) = self.selected_motor_id() else {
+        if self.selected_motor_id().is_none() {
             self.log_msg("No motor selected.".to_string());
             return;
-        };
+        }
+        let idx = self.selected_motor;
+        let spec = self.motors[idx].spec.clone();
         let mode = match input.trim().to_lowercase().as_str() {
             "mit" | "0" => RunMode::Mit,
             "position" | "pos" | "1" => RunMode::Position,
@@ -945,21 +1026,38 @@ impl App {
                 return;
             }
         };
-        let Some((host_id, _, model)) = self.selected_robstride() else { return; };
-        match Motor::new(&self.interface, mid, host_id, model) {
-            Ok(mut motor) => match motor.set_run_mode(mode) {
-                Ok(()) => self.log_msg(format!("Run mode set to {:?}", mode)),
-                Err(e) => self.log_msg(format!("Set run mode failed: {}", e)),
+
+        match spec {
+            MotorSpec::Robstride {
+                host_id,
+                can_id,
+                model,
+                ..
+            } => match Motor::new(&self.interface, can_id, host_id, model) {
+                Ok(mut motor) => match motor.set_run_mode(mode) {
+                    Ok(()) => self.log_msg(format!("Run mode set to {:?}", mode)),
+                    Err(e) => self.log_msg(format!("Set run mode failed: {}", e)),
+                },
+                Err(e) => self.log_msg(format!("CAN open error: {}", e)),
             },
-            Err(e) => self.log_msg(format!("CAN open error: {}", e)),
+            MotorSpec::Damiao { .. } => {
+                if matches!(mode, RunMode::Mit) {
+                    self.log_msg("DAMIAO uses MIT mode only (already active).".to_string());
+                } else {
+                    self.log_msg("DAMIAO supports MIT mode only in this TUI.".to_string());
+                }
+            }
         }
     }
 
     fn execute_move_to(&mut self, input: &str) {
-        let Some(mid) = self.selected_motor_id() else {
+        if self.selected_motor_id().is_none() {
             self.log_msg("No motor selected.".to_string());
             return;
-        };
+        }
+        let idx = self.selected_motor;
+        let spec = self.motors[idx].spec.clone();
+
         let parts: Vec<&str> = input.trim().split_whitespace().collect();
         if parts.is_empty() {
             self.log_msg("Usage: position_rad [speed_limit]".to_string());
@@ -978,35 +1076,72 @@ impl App {
             5.0
         };
 
-        let Some((host_id, _, model)) = self.selected_robstride() else { return; };
-        match Motor::new(&self.interface, mid, host_id, model) {
-            Ok(mut motor) => {
-                let r = (|| -> std::result::Result<(), robstride_sandbox::error::RobstrideError> {
-                    motor.disable()?;
-                    motor.set_run_mode(RunMode::Position)?;
-                    motor.set_position_speed_limit(speed)?;
-                    motor.enable()?;
-                    motor.set_position(pos)?;
-                    Ok(())
+        match spec {
+            MotorSpec::Robstride {
+                host_id,
+                can_id,
+                model,
+                ..
+            } => match Motor::new(&self.interface, can_id, host_id, model) {
+                Ok(mut motor) => {
+                    let r = (|| -> std::result::Result<(), robstride_sandbox::error::RobstrideError> {
+                        motor.disable()?;
+                        motor.set_run_mode(RunMode::Position)?;
+                        motor.set_position_speed_limit(speed)?;
+                        motor.enable()?;
+                        motor.set_position(pos)?;
+                        Ok(())
+                    })();
+                    match r {
+                        Ok(()) => {
+                            self.log_msg(format!("Moving to {:.3} rad (speed limit={:.1})", pos, speed));
+                            self.motors[idx].enabled = true;
+                        }
+                        Err(e) => self.log_msg(format!("Move to failed: {}", e)),
+                    }
+                    std::mem::forget(motor);
+                }
+                Err(e) => self.log_msg(format!("CAN open error: {}", e)),
+            },
+            MotorSpec::Damiao { .. } => {
+                let socket = match CanSocket::open(&self.interface) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        self.log_msg(format!("CAN open error: {}", e));
+                        return;
+                    }
+                };
+                let _ = socket.set_read_timeout(Duration::from_millis(50));
+                let mut driver = self.apply_saved_offset(spec).build();
+                let r = (|| -> robstride_sandbox::error::Result<MotorFeedback> {
+                    driver.enable(&socket)?;
+                    driver.mit_exchange(&socket, pos as f64, 0.0, DM_MOVE_KP, DM_MOVE_KD, 0.0)
                 })();
                 match r {
-                    Ok(()) => {
-                        self.log_msg(format!("Moving to {:.3} rad (speed limit={:.1})", pos, speed));
-                        self.motors[self.selected_motor].enabled = true;
+                    Ok(fb) => {
+                        self.log_msg(format!(
+                            "DAMIAO move target sent: pos={:.3} (vel clamp={:.1})",
+                            pos, speed
+                        ));
+                        self.motors[idx].enabled = true;
+                        self.motors[idx].feedback = Some(fb);
+                        self.motors[idx].last_update = Some(Instant::now());
+                        self.motors[idx].error = None;
                     }
                     Err(e) => self.log_msg(format!("Move to failed: {}", e)),
                 }
-                std::mem::forget(motor);
             }
-            Err(e) => self.log_msg(format!("CAN open error: {}", e)),
         }
     }
 
     fn execute_spin(&mut self, input: &str) {
-        let Some(mid) = self.selected_motor_id() else {
+        if self.selected_motor_id().is_none() {
             self.log_msg("No motor selected.".to_string());
             return;
-        };
+        }
+        let idx = self.selected_motor;
+        let spec = self.motors[idx].spec.clone();
+
         let vel: f32 = match input.trim().parse() {
             Ok(v) => v,
             Err(_) => {
@@ -1014,34 +1149,69 @@ impl App {
                 return;
             }
         };
-        let Some((host_id, _, model)) = self.selected_robstride() else { return; };
-        match Motor::new(&self.interface, mid, host_id, model) {
-            Ok(mut motor) => {
-                let r = (|| -> std::result::Result<(), robstride_sandbox::error::RobstrideError> {
-                    motor.disable()?;
-                    motor.set_run_mode(RunMode::Velocity)?;
-                    motor.enable()?;
-                    motor.set_velocity(vel)?;
-                    Ok(())
+
+        match spec {
+            MotorSpec::Robstride {
+                host_id,
+                can_id,
+                model,
+                ..
+            } => match Motor::new(&self.interface, can_id, host_id, model) {
+                Ok(mut motor) => {
+                    let r = (|| -> std::result::Result<(), robstride_sandbox::error::RobstrideError> {
+                        motor.disable()?;
+                        motor.set_run_mode(RunMode::Velocity)?;
+                        motor.enable()?;
+                        motor.set_velocity(vel)?;
+                        Ok(())
+                    })();
+                    match r {
+                        Ok(()) => {
+                            self.log_msg(format!("Spinning at {:.2} rad/s", vel));
+                            self.motors[idx].enabled = true;
+                        }
+                        Err(e) => self.log_msg(format!("Spin failed: {}", e)),
+                    }
+                    std::mem::forget(motor);
+                }
+                Err(e) => self.log_msg(format!("CAN open error: {}", e)),
+            },
+            MotorSpec::Damiao { .. } => {
+                let socket = match CanSocket::open(&self.interface) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        self.log_msg(format!("CAN open error: {}", e));
+                        return;
+                    }
+                };
+                let _ = socket.set_read_timeout(Duration::from_millis(50));
+                let mut driver = self.apply_saved_offset(spec).build();
+                let r = (|| -> robstride_sandbox::error::Result<MotorFeedback> {
+                    driver.enable(&socket)?;
+                    driver.mit_exchange(&socket, 0.0, vel as f64, 0.0, DM_SPIN_KD, 0.0)
                 })();
                 match r {
-                    Ok(()) => {
-                        self.log_msg(format!("Spinning at {:.2} rad/s", vel));
-                        self.motors[self.selected_motor].enabled = true;
+                    Ok(fb) => {
+                        self.log_msg(format!("DAMIAO velocity target sent: {:.2} rad/s", vel));
+                        self.motors[idx].enabled = true;
+                        self.motors[idx].feedback = Some(fb);
+                        self.motors[idx].last_update = Some(Instant::now());
+                        self.motors[idx].error = None;
                     }
                     Err(e) => self.log_msg(format!("Spin failed: {}", e)),
                 }
-                std::mem::forget(motor);
             }
-            Err(e) => self.log_msg(format!("CAN open error: {}", e)),
         }
     }
 
     fn execute_torque(&mut self, input: &str) {
-        let Some(mid) = self.selected_motor_id() else {
+        if self.selected_motor_id().is_none() {
             self.log_msg("No motor selected.".to_string());
             return;
-        };
+        }
+        let idx = self.selected_motor;
+        let spec = self.motors[idx].spec.clone();
+
         let torque: f32 = match input.trim().parse() {
             Ok(v) => v,
             Err(_) => {
@@ -1049,34 +1219,69 @@ impl App {
                 return;
             }
         };
-        let Some((host_id, _, model)) = self.selected_robstride() else { return; };
-        match Motor::new(&self.interface, mid, host_id, model) {
-            Ok(mut motor) => {
-                let r = (|| -> std::result::Result<(), robstride_sandbox::error::RobstrideError> {
-                    motor.disable()?;
-                    motor.set_run_mode(RunMode::Torque)?;
-                    motor.enable()?;
-                    motor.set_torque(torque)?;
-                    Ok(())
+
+        match spec {
+            MotorSpec::Robstride {
+                host_id,
+                can_id,
+                model,
+                ..
+            } => match Motor::new(&self.interface, can_id, host_id, model) {
+                Ok(mut motor) => {
+                    let r = (|| -> std::result::Result<(), robstride_sandbox::error::RobstrideError> {
+                        motor.disable()?;
+                        motor.set_run_mode(RunMode::Torque)?;
+                        motor.enable()?;
+                        motor.set_torque(torque)?;
+                        Ok(())
+                    })();
+                    match r {
+                        Ok(()) => {
+                            self.log_msg(format!("Applying torque {:.3} Nm", torque));
+                            self.motors[idx].enabled = true;
+                        }
+                        Err(e) => self.log_msg(format!("Torque failed: {}", e)),
+                    }
+                    std::mem::forget(motor);
+                }
+                Err(e) => self.log_msg(format!("CAN open error: {}", e)),
+            },
+            MotorSpec::Damiao { .. } => {
+                let socket = match CanSocket::open(&self.interface) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        self.log_msg(format!("CAN open error: {}", e));
+                        return;
+                    }
+                };
+                let _ = socket.set_read_timeout(Duration::from_millis(50));
+                let mut driver = self.apply_saved_offset(spec).build();
+                let r = (|| -> robstride_sandbox::error::Result<MotorFeedback> {
+                    driver.enable(&socket)?;
+                    driver.mit_exchange(&socket, 0.0, 0.0, 0.0, 0.0, torque as f64)
                 })();
                 match r {
-                    Ok(()) => {
-                        self.log_msg(format!("Applying torque {:.3} Nm", torque));
-                        self.motors[self.selected_motor].enabled = true;
+                    Ok(fb) => {
+                        self.log_msg(format!("DAMIAO torque target sent: {:.3} Nm", torque));
+                        self.motors[idx].enabled = true;
+                        self.motors[idx].feedback = Some(fb);
+                        self.motors[idx].last_update = Some(Instant::now());
+                        self.motors[idx].error = None;
                     }
                     Err(e) => self.log_msg(format!("Torque failed: {}", e)),
                 }
-                std::mem::forget(motor);
             }
-            Err(e) => self.log_msg(format!("CAN open error: {}", e)),
         }
     }
 
     fn execute_mit(&mut self, input: &str) {
-        let Some(mid) = self.selected_motor_id() else {
+        if self.selected_motor_id().is_none() {
             self.log_msg("No motor selected.".to_string());
             return;
-        };
+        }
+        let idx = self.selected_motor;
+        let spec = self.motors[idx].spec.clone();
+
         let parts: Vec<f64> = input
             .trim()
             .split_whitespace()
@@ -1086,15 +1291,54 @@ impl App {
             self.log_msg("Usage: pos vel kp kd torque (5 values)".to_string());
             return;
         }
-        let Some((host_id, _, model)) = self.selected_robstride() else { return; };
-        match Motor::new(&self.interface, mid, host_id, model) {
-            Ok(mut motor) => {
-                let r = (|| -> std::result::Result<MotorFeedback, robstride_sandbox::error::RobstrideError> {
-                    if !self.motors[self.selected_motor].enabled {
-                        motor.enable()?;
-                        self.motors[self.selected_motor].enabled = true;
+
+        match spec {
+            MotorSpec::Robstride {
+                host_id,
+                can_id,
+                model,
+                ..
+            } => match Motor::new(&self.interface, can_id, host_id, model) {
+                Ok(mut motor) => {
+                    let r =
+                        (|| -> std::result::Result<MotorFeedback, robstride_sandbox::error::RobstrideError> {
+                            if !self.motors[idx].enabled {
+                                motor.enable()?;
+                                self.motors[idx].enabled = true;
+                            }
+                            motor.mit_control(parts[0], parts[1], parts[2], parts[3], parts[4])
+                        })();
+                    match r {
+                        Ok(fb) => {
+                            self.log_msg(format!(
+                                "MIT: pos={:.4} vel={:.4} torque={:.4}",
+                                fb.position, fb.velocity, fb.torque
+                            ));
+                            self.motors[idx].feedback = Some(fb);
+                            self.motors[idx].last_update = Some(Instant::now());
+                        }
+                        Err(e) => self.log_msg(format!("MIT control failed: {}", e)),
                     }
-                    motor.mit_control(parts[0], parts[1], parts[2], parts[3], parts[4])
+                    std::mem::forget(motor);
+                }
+                Err(e) => self.log_msg(format!("CAN open error: {}", e)),
+            },
+            MotorSpec::Damiao { .. } => {
+                let socket = match CanSocket::open(&self.interface) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        self.log_msg(format!("CAN open error: {}", e));
+                        return;
+                    }
+                };
+                let _ = socket.set_read_timeout(Duration::from_millis(50));
+                let mut driver = self.apply_saved_offset(spec).build();
+                let r = (|| -> robstride_sandbox::error::Result<MotorFeedback> {
+                    if !self.motors[idx].enabled {
+                        driver.enable(&socket)?;
+                        self.motors[idx].enabled = true;
+                    }
+                    driver.mit_exchange(&socket, parts[0], parts[1], parts[2], parts[3], parts[4])
                 })();
                 match r {
                     Ok(fb) => {
@@ -1102,14 +1346,13 @@ impl App {
                             "MIT: pos={:.4} vel={:.4} torque={:.4}",
                             fb.position, fb.velocity, fb.torque
                         ));
-                        self.motors[self.selected_motor].feedback = Some(fb);
-                        self.motors[self.selected_motor].last_update = Some(Instant::now());
+                        self.motors[idx].feedback = Some(fb);
+                        self.motors[idx].last_update = Some(Instant::now());
+                        self.motors[idx].error = None;
                     }
                     Err(e) => self.log_msg(format!("MIT control failed: {}", e)),
                 }
-                std::mem::forget(motor);
             }
-            Err(e) => self.log_msg(format!("CAN open error: {}", e)),
         }
     }
 
