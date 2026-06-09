@@ -43,16 +43,24 @@ pub enum BilateralMethod {
     OnDemand,
     /// 6: Leader stays enabled but outputs ~zero torque until contact.
     EmulatedOnDemand,
+    /// 7: Virtual coupling executed by the **motor's internal kp/kd loop**.
+    /// The CAN-rate outer loop just relays each motor's measured pos/vel
+    /// to the other side as a reference; the PD itself runs at the
+    /// motor's internal control rate (~10 kHz), removing the
+    /// 2 ms / one-CAN-cycle transport delay that limits how stiff the
+    /// standard `VirtualCoupling` method can be before it rings.
+    VirtualCouplingMit,
 }
 
 impl BilateralMethod {
-    pub const ALL: [BilateralMethod; 6] = [
+    pub const ALL: [BilateralMethod; 7] = [
         BilateralMethod::PositionMirroring,
         BilateralMethod::ForceReflecting,
         BilateralMethod::VirtualCoupling,
         BilateralMethod::ModeSpace,
         BilateralMethod::OnDemand,
         BilateralMethod::EmulatedOnDemand,
+        BilateralMethod::VirtualCouplingMit,
     ];
 
     pub fn label(&self) -> &'static str {
@@ -63,6 +71,7 @@ impl BilateralMethod {
             BilateralMethod::ModeSpace => "Mode Space (4ch)",
             BilateralMethod::OnDemand => "On-Demand",
             BilateralMethod::EmulatedOnDemand => "Emulated On-Demand",
+            BilateralMethod::VirtualCouplingMit => "Virtual Coupling (MIT-internal PD)",
         }
     }
 
@@ -74,6 +83,7 @@ impl BilateralMethod {
             BilateralMethod::ModeSpace => "mode",
             BilateralMethod::OnDemand => "ondemand",
             BilateralMethod::EmulatedOnDemand => "ondemand_emu",
+            BilateralMethod::VirtualCouplingMit => "coupling_mit",
         }
     }
 
@@ -88,6 +98,7 @@ impl BilateralMethod {
             "ondemand_emu" | "emulated" | "emu" | "eod" | "6" => {
                 Some(Self::EmulatedOnDemand)
             }
+            "coupling_mit" | "cmit" | "mit" | "7" => Some(Self::VirtualCouplingMit),
             _ => None,
         }
     }
@@ -611,6 +622,14 @@ fn run_bilateral_loop(
                 let tau_f = tau_diff + tau_ext_l;
                 (tau_l, tau_f)
             }
+            BilateralMethod::VirtualCouplingMit => {
+                // The coupling PD runs inside each motor at ~10 kHz; the
+                // outer CAN loop only relays pos/vel references. We emit
+                // no coupling torque ourselves here — friction/inertia
+                // compensation is still applied as feedforward (`tau_ff`
+                // = `tau_*_total` below).
+                (0.0, 0.0)
+            }
             BilateralMethod::OnDemand => {
                 unreachable!("OnDemand uses run_ondemand_loop")
             }
@@ -692,23 +711,34 @@ fn run_bilateral_loop(
         //
         // This "negative damping" runs at motor's internal rate (~10kHz),
         // providing much faster assist than CAN-rate feedforward.
-        let (mit_kd_leader, mit_vel_leader) = if config.gains.assist_kd > 0.0 {
-            // vel_ref slightly ahead of current velocity → motor assists motion
-            // Ramp up kd for safety during soft-start
-            // Clamp vel delta so assist torque <= max_assist
-            let kd_ramped = config.gains.assist_kd * ramp;
-            let vel_delta = prev_l_vel * (config.gains.vel_ahead - 1.0);
-            let max_delta = if kd_ramped > 0.0 {
-                config.gains.max_assist / kd_ramped
+        //
+        // For VirtualCouplingMit the same channel is repurposed: we send
+        // the *other* motor's pos/vel as the reference, plus the user's
+        // kp/kd, and the motor itself runs the bilateral PD at its own
+        // internal rate (eliminating the CAN-cycle transport delay that
+        // limits how stiff the outer-loop VirtualCoupling can be).
+        let is_mit_coupling = config.method == BilateralMethod::VirtualCouplingMit;
+        let (mit_pos_leader, mit_vel_leader, mit_kp_leader, mit_kd_leader) =
+            if is_mit_coupling {
+                // Reference for the leader is the follower's measured state.
+                (prev_f_pos, vel_f_eff, kp * ramp, kd * ramp)
+            } else if config.gains.assist_kd > 0.0 {
+                // vel_ref slightly ahead of current velocity → motor assists motion
+                // Ramp up kd for safety during soft-start
+                // Clamp vel delta so assist torque <= max_assist
+                let kd_ramped = config.gains.assist_kd * ramp;
+                let vel_delta = prev_l_vel * (config.gains.vel_ahead - 1.0);
+                let max_delta = if kd_ramped > 0.0 {
+                    config.gains.max_assist / kd_ramped
+                } else {
+                    0.0
+                };
+                let vel_ref = prev_l_vel + vel_delta.clamp(-max_delta, max_delta);
+                (0.0, vel_ref, 0.0, kd_ramped)
             } else {
-                0.0
+                (0.0, 0.0, 0.0, 0.0)
             };
-            let vel_ref = prev_l_vel + vel_delta.clamp(-max_delta, max_delta);
-            (kd_ramped, vel_ref)
-        } else {
-            (0.0, 0.0)
-        };
-        let leader_vel_assist_est = if config.gains.assist_kd > 0.0 {
+        let leader_vel_assist_est = if !is_mit_coupling && config.gains.assist_kd > 0.0 {
             let vel_delta = prev_l_vel * (config.gains.vel_ahead - 1.0);
             let kd_ramped = config.gains.assist_kd * ramp;
             let max_delta = if kd_ramped > 0.0 {
@@ -721,9 +751,24 @@ fn run_bilateral_loop(
             0.0
         };
 
+        // Follower: in standard methods only feedforward torque is sent
+        // (kp=0, kd=0). In VirtualCouplingMit the follower's MIT loop
+        // also runs the PD against the leader's measured state.
+        let (mit_pos_follower, mit_vel_follower, mit_kp_follower, mit_kd_follower) =
+            if is_mit_coupling {
+                (prev_l_pos, vel_l_eff, kp * ramp, kd * ramp)
+            } else {
+                (0.0, 0.0, 0.0, 0.0)
+            };
+
         // Send MIT commands
         let fb_l = match leader.mit_exchange(
-            &socket, 0.0, mit_vel_leader, 0.0, mit_kd_leader, tau_leader_clamped,
+            &socket,
+            mit_pos_leader,
+            mit_vel_leader,
+            mit_kp_leader,
+            mit_kd_leader,
+            tau_leader_clamped,
         ) {
             Ok(fb) => fb,
             Err(_e) => {
@@ -734,7 +779,12 @@ fn run_bilateral_loop(
         };
 
         let fb_f = match follower.mit_exchange(
-            &socket, 0.0, 0.0, 0.0, 0.0, tau_follower_clamped,
+            &socket,
+            mit_pos_follower,
+            mit_vel_follower,
+            mit_kp_follower,
+            mit_kd_follower,
+            tau_follower_clamped,
         ) {
             Ok(fb) => fb,
             Err(_e) => {
