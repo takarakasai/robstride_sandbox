@@ -249,6 +249,9 @@ fn params_for_command(cmd: Command) -> Vec<ParamField> {
             ParamField::with_choices("open_sign", "0", "Opening dir (ondemand: 0=off, +1/-1)",
                 "-1|0|+1"),
             ParamField::new("safety_rad", "3.14", "Disable both motors if |pos|>this [rad] (0=off)"),
+            ParamField::new("safety_jump", "0.5", "Disable if Δpos/cycle > this [rad] (0=off)"),
+            ParamField::new("vel_cut", "0.0", "Velocity LPF cutoff [rad/s] for kd (0=raw motor vel, recommended for DAMIAO)"),
+            ParamField::new("tau_slew", "0.0", "Torque slew limit [Nm/cycle] (0=off)"),
         ],
         Command::ZeroPair => vec![
             ParamField::with_choices("lead_kind", "rs05", "Leader motor kind",
@@ -1492,7 +1495,8 @@ impl App {
         //   6: method, 7: kp, 8: kd, 9: coulomb, 10: viscous, 11: force_scale,
         //   12: inertia, 13: dob_cutoff, 14: inertia_comp, 15: accel_cutoff,
         //   16: assist_kd, 17: vel_ahead, 18: max_assist,
-        //   19: force_threshold, 20: open_sign, 21: safety_rad
+        //   19: force_threshold, 20: open_sign, 21: safety_rad, 22: safety_jump,
+        //   23: vel_cut, 24: tau_slew
         let parts: Vec<&str> = input.trim().split_whitespace().collect();
         let get = |i: usize| parts.get(i).copied();
         let bool_flag = |s: &str| matches!(s.trim(), "1" | "true" | "yes" | "on");
@@ -1553,6 +1557,11 @@ impl App {
         let safety_radius: f64 = get(21)
             .and_then(|s| s.parse().ok())
             .unwrap_or(std::f64::consts::PI);
+        let safety_max_jump: f64 = get(22)
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0.5);
+        if let Some(s) = get(23) { gains.vel_cutoff = s.parse().unwrap_or(gains.vel_cutoff); }
+        if let Some(s) = get(24) { gains.tau_slew = s.parse().unwrap_or(gains.tau_slew); }
 
         let config = BilateralConfig {
             interface: self.interface.clone(),
@@ -1563,17 +1572,18 @@ impl App {
             gains,
             loop_period_us: 2000,
             safety_radius,
-            safety_max_jump: 0.5,
+            safety_max_jump,
         };
 
         self.log_msg(format!(
-            "Starting bilateral control: {} (Kp={:.2}, Kd={:.2}, Cf={:.3}, Vf={:.3}, safety_rad={:.2})",
+            "Starting bilateral control: {} (Kp={:.2}, Kd={:.2}, Cf={:.3}, Vf={:.3}, safety_rad={:.2}, safety_jump={:.2})",
             method.label(),
             gains.kp,
             gains.kd,
             gains.coulomb_friction,
             gains.viscous_friction,
             safety_radius,
+            safety_max_jump,
         ));
         self.log_msg(format!(
             "  Leader={}, Follower={}  Press Esc to stop.",
