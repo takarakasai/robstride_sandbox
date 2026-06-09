@@ -2593,6 +2593,23 @@ fn main() -> Result<()> {
 
     let model = MotorModel::from_str(&model_str).unwrap_or(MotorModel::Rs05);
 
+    // Acquire an exclusive lock on the CAN interface BEFORE touching the
+    // terminal. If another robstride_tui (or any other process using this
+    // crate) is already driving the same bus the operator must stop it
+    // first — concurrent writes from two hosts on the same bus produce
+    // cross-talk that the per-host filter in `mit_exchange` cannot
+    // disambiguate when both ends use the same host_id, leading to wildly
+    // oscillatory bilateral control (a previously-debugged failure mode).
+    // The guard is dropped at the end of `main`, releasing the lock and
+    // removing the lock file.
+    let _can_lock = match robstride_sandbox::can_lock::CanInterfaceLock::acquire(&interface) {
+        Ok(g) => g,
+        Err(e) => {
+            eprintln!("Refusing to start: {e}");
+            std::process::exit(1);
+        }
+    };
+
     // Setup terminal
     terminal::enable_raw_mode()?;
     let mut stdout = io::stdout();
