@@ -52,6 +52,14 @@ sudo ip link set can0 up
 ip -details link show can0
 ```
 
+### DAMIAO / CAN FD 5Mbps の場合
+
+```bash
+sudo ./scripts/setup_5mbps.sh
+```
+
+このスクリプトは `can0` を CAN FD モードにして、ARB 1Mbps / DATA 5Mbps で起動します。
+
 ## ビルド
 
 ```bash

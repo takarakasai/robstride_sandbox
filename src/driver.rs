@@ -11,7 +11,7 @@
 
 use std::time::{Duration, Instant};
 
-use socketcan::{CanSocket, EmbeddedFrame, ExtendedId, Id, Socket, StandardId};
+use socketcan::{frame::FdFlags, CanFdFrame, CanFdSocket, CanSocket, EmbeddedFrame, ExtendedId, Id, Socket, StandardId};
 
 use crate::error::{Result, RobstrideError};
 use crate::protocol::*;
@@ -676,7 +676,7 @@ pub fn scan_damiao(
     range: std::ops::RangeInclusive<u8>,
     per_id_timeout: Duration,
 ) -> Result<Vec<u8>> {
-    let socket = CanSocket::open(interface)?;
+    let socket = CanFdSocket::open(interface)?;
     socket.set_read_timeout(per_id_timeout)?;
 
     // Drain any frames already in the socket buffer so they don't
@@ -689,8 +689,8 @@ pub fn scan_damiao(
             Some(id) => id,
             None => continue,
         };
-        let enable_frame = socketcan::CanFrame::new(Id::Standard(std_id), &DM_ENABLE)
-            .expect("8-byte DM_ENABLE fits a CAN data frame");
+        let enable_frame = CanFdFrame::with_flags(Id::Standard(std_id), &DM_ENABLE, FdFlags::BRS)
+            .expect("8-byte DM_ENABLE fits a CAN FD frame");
         if socket.write_frame(&enable_frame).is_err() {
             continue;
         }
@@ -726,8 +726,8 @@ pub fn scan_damiao(
         }
 
         // Always send disable so a responding motor returns to safe state.
-        let disable_frame = socketcan::CanFrame::new(Id::Standard(std_id), &DM_DISABLE)
-            .expect("8-byte DM_DISABLE fits a CAN data frame");
+        let disable_frame = CanFdFrame::with_flags(Id::Standard(std_id), &DM_DISABLE, FdFlags::BRS)
+            .expect("8-byte DM_DISABLE fits a CAN FD frame");
         let _ = socket.write_frame(&disable_frame);
         // Tiny gap so the motor processes the disable before the next probe.
         std::thread::sleep(Duration::from_millis(2));
